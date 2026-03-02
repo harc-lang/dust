@@ -361,13 +361,7 @@ impl Render for DustApp {
         self.drain_messages(window, cx);
 
         if self.form.read(cx).is_dirty() {
-            let mut value = self.form.read(cx).to_value();
-            if self.has_state {
-                if let Some(obj) = value.as_object_mut() {
-                    obj.remove("initial");
-                    obj.remove("compute");
-                }
-            }
+            let value = self.form.read(cx).to_value();
             self.send(Command::UpdateConfig(value));
         }
 

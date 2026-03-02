@@ -459,13 +459,7 @@ impl TuiState {
                     EventResult::Consumed {
                         value_changed: true,
                     } => {
-                        let mut value = tree.to_value();
-                        if self.has_state {
-                            if let Some(obj) = value.as_object_mut() {
-                                obj.remove("initial");
-                                obj.remove("compute");
-                            }
-                        }
+                        let value = tree.to_value();
                         return Some(Command::UpdateConfig(value));
                     }
                     EventResult::Consumed {

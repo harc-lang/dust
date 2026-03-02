@@ -356,15 +356,15 @@ impl<S: Solver> Driver<S> {
     fn update_config(&mut self, patch: Value) -> Vec<Message> {
         if self.state.is_some() {
             if let Some(obj) = patch.as_object() {
-                if obj.contains_key("initial") {
-                    return vec![Message::ConfigUpdated(Err(
-                        "initial config cannot be changed while state exists".into(),
-                    ))];
-                }
-                if obj.contains_key("compute") {
-                    return vec![Message::ConfigUpdated(Err(
-                        "compute config cannot be changed while state exists".into(),
-                    ))];
+                let current = serde_json::to_value(&self.config).unwrap_or_default();
+                for section in ["initial", "compute"] {
+                    if let Some(incoming) = obj.get(section) {
+                        if current.get(section) != Some(incoming) {
+                            return vec![Message::ConfigUpdated(Err(
+                                format!("{} config cannot be changed while state exists", section),
+                            ))];
+                        }
+                    }
                 }
             }
         }
