@@ -37,7 +37,7 @@ struct DustPhysics {
 impl Default for DustPhysics {
     fn default() -> Self {
         Self {
-            tfinal: 100.0,
+            tfinal: 1e6,
             dt: 0.001,
             softening: 0.05,
             central_mass: 1.0,
@@ -298,9 +298,6 @@ impl DustApp {
             match self.handle.msg_rx.try_recv() {
                 Ok(Message::StepCompleted { display, .. }) => {
                     self.status_text = display;
-                    if self.running {
-                        let _ = self.handle.cmd_tx.send(Command::QueryPlotData);
-                    }
                 }
                 Ok(Message::PlotData { linear, .. }) => {
                     if let (Some(x), Some(y)) = (linear.get("x"), linear.get("y")) {
@@ -312,12 +309,11 @@ impl DustApp {
                             .series(Series::scatter(x.clone(), y.clone()).label("particles"));
                         self.plot = cx.new(|_cx| new_plot);
                     }
-                    cx.notify();
                 }
                 Ok(Message::SimulationDone) => {
                     self.running = false;
                     self.status_text = "Simulation done".into();
-                    let _ = self.handle.cmd_tx.send(Command::QueryPlotData);
+                    self.send(Command::QueryPlotData);
                 }
                 Ok(Message::StateCreated) => {
                     self.has_state = true;
@@ -325,7 +321,7 @@ impl DustApp {
                     self.form.update(cx, |form, cx| {
                         form.set_filter(DustFilter { has_state: true }, window, cx);
                     });
-                    let _ = self.handle.cmd_tx.send(Command::QueryPlotData);
+                    self.send(Command::QueryPlotData);
                 }
                 Ok(Message::StateDestroyed) => {
                     self.has_state = false;
@@ -334,7 +330,6 @@ impl DustApp {
                         form.set_filter(DustFilter { has_state: false }, window, cx);
                     });
                     self.plot = cx.new(|_cx| Plot::new().grid(true).aspect_ratio(1.0));
-                    cx.notify();
                 }
                 Ok(Message::Error(e)) => {
                     self.status_text = format!("Error: {}", e);
@@ -348,6 +343,12 @@ impl DustApp {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
+        }
+
+        if self.running {
+            self.send(Command::QueryStatus);
+            self.send(Command::QueryPlotData);
+            cx.notify();
         }
     }
 

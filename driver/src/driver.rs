@@ -56,6 +56,8 @@ pub struct Driver<S: Solver> {
     driver_state: DriverState,
     mode: DriverMode,
     schema: Value,
+    /// Buffered step completion info; held until the frontend asks for it.
+    pending_step: Option<Message>,
 }
 
 impl<S: Solver> Driver<S> {
@@ -76,6 +78,7 @@ impl<S: Solver> Driver<S> {
             driver_state,
             mode: DriverMode::Idle,
             schema,
+            pending_step: None,
         };
 
         let mut msgs = Vec::new();
@@ -120,14 +123,22 @@ impl<S: Solver> Driver<S> {
                 if self.state.is_none() {
                     msgs.push(Message::Error("no state".into()));
                 } else {
+                    let was_running = self.mode == DriverMode::Running;
                     self.mode = DriverMode::Running;
-                    let s = self.state.as_ref().unwrap();
-                    msgs.push(Message::Status {
-                        mode: DriverMode::Running,
-                        iteration: self.driver_state.iteration,
-                        time: self.solver.time(s),
-                    });
+                    if !was_running {
+                        let s = self.state.as_ref().unwrap();
+                        msgs.push(Message::Status {
+                            mode: DriverMode::Running,
+                            iteration: self.driver_state.iteration,
+                            time: self.solver.time(s),
+                        });
+                    }
                     self.step_or_finish(&mut msgs);
+                    // Buffer the StepCompleted message instead of sending it
+                    // immediately; the frontend retrieves it via QueryStatus.
+                    if let Some(pos) = msgs.iter().position(|m| matches!(m, Message::StepCompleted { .. })) {
+                        self.pending_step = Some(msgs.remove(pos));
+                    }
                 }
             }
             Command::Pause => {
@@ -163,6 +174,9 @@ impl<S: Solver> Driver<S> {
                 }
             }
             Command::QueryStatus => {
+                if let Some(step) = self.pending_step.take() {
+                    msgs.push(step);
+                }
                 let time = self
                     .state
                     .as_ref()
