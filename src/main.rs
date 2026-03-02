@@ -290,6 +290,8 @@ struct DustApp {
     running: bool,
     has_state: bool,
     status_text: String,
+    plot_query_pending: bool,
+    status_query_pending: bool,
 }
 
 impl DustApp {
@@ -298,8 +300,10 @@ impl DustApp {
             match self.handle.msg_rx.try_recv() {
                 Ok(Message::StepCompleted { display, .. }) => {
                     self.status_text = display;
+                    self.status_query_pending = false;
                 }
                 Ok(Message::PlotData { linear, .. }) => {
+                    self.plot_query_pending = false;
                     if let (Some(x), Some(y)) = (linear.get("x"), linear.get("y")) {
                         let new_plot = Plot::new()
                             .grid(true)
@@ -313,6 +317,7 @@ impl DustApp {
                 Ok(Message::SimulationDone) => {
                     self.running = false;
                     self.status_text = "Simulation done".into();
+                    self.plot_query_pending = true;
                     self.send(Command::QueryPlotData);
                 }
                 Ok(Message::StateCreated) => {
@@ -321,6 +326,7 @@ impl DustApp {
                     self.form.update(cx, |form, cx| {
                         form.set_filter(DustFilter { has_state: true }, window, cx);
                     });
+                    self.plot_query_pending = true;
                     self.send(Command::QueryPlotData);
                 }
                 Ok(Message::StateDestroyed) => {
@@ -346,8 +352,14 @@ impl DustApp {
         }
 
         if self.running {
-            self.send(Command::QueryStatus);
-            self.send(Command::QueryPlotData);
+            if !self.status_query_pending {
+                self.status_query_pending = true;
+                self.send(Command::QueryStatus);
+            }
+            if !self.plot_query_pending {
+                self.plot_query_pending = true;
+                self.send(Command::QueryPlotData);
+            }
             cx.notify();
         }
     }
@@ -566,6 +578,8 @@ fn main() {
                     running: false,
                     has_state: false,
                     status_text: "Ready".into(),
+                    plot_query_pending: false,
+                    status_query_pending: false,
                 });
 
                 cx.new(|cx| Root::new(app_entity, window, cx))
