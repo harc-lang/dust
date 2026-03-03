@@ -272,8 +272,8 @@ impl Solver for Dust {
 
     fn message(&self, _state: &State, info: &StepInfo) -> String {
         format!(
-            "[{:06}] t={:.4e} n={}",
-            info.iteration, info.time, self.initial.num_particles,
+            "[{:06}] t={:.6e}  dt={:.4e}  n={}",
+            info.iteration, info.time, info.seconds, self.initial.num_particles,
         )
     }
 }
@@ -503,6 +503,7 @@ impl Render for DustApp {
                         div()
                             .pl_4()
                             .text_xs()
+                            .font_family(cx.theme().mono_font_family.clone())
                             .text_color(cx.theme().muted_foreground)
                             .child(status),
                     ),
