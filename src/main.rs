@@ -290,6 +290,7 @@ struct DustApp {
     plot: Entity<Plot>,
     status_text: String,
     last_snapshot: Snapshot,
+    pending_frames: u32,
 }
 
 impl DustApp {
@@ -354,8 +355,11 @@ impl DustApp {
             }
         }
 
-        // Keep rendering while running
-        if self.last_snapshot.mode == DriverMode::Running {
+        // Keep rendering while running or while waiting for command results
+        if self.last_snapshot.mode == DriverMode::Running || self.pending_frames > 0 {
+            if self.pending_frames > 0 {
+                self.pending_frames -= 1;
+            }
             window.request_animation_frame();
         }
     }
@@ -368,8 +372,9 @@ impl DustApp {
         self.last_snapshot.has_state
     }
 
-    fn send(&self, cmd: Command) {
+    fn send(&mut self, cmd: Command) {
         let _ = self.handle.cmd_tx.send(cmd);
+        self.pending_frames = 10;
     }
 }
 
@@ -584,6 +589,7 @@ fn main() {
                     plot,
                     status_text: "Ready".into(),
                     last_snapshot: Snapshot::default(),
+                    pending_frames: 0,
                 });
 
                 cx.new(|cx| Root::new(app_entity, window, cx))
