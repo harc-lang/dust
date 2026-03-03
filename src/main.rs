@@ -11,7 +11,7 @@ use gpui::{
     Window, WindowOptions, actions, div, px, size,
 };
 use gpui_component::{ActiveTheme, Root, h_flex, scroll::ScrollableElement, v_flex};
-use gpui_plot::{Plot, PlotStyle, Series};
+use gpui_plot::{Plot, PlotStyle, Series, data_range};
 use gpui_schema::{NodeFilter, SchemaForm};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -301,12 +301,19 @@ impl DustApp {
         // Update plot data in place (preserves pan/zoom view state)
         if snap.iteration != self.last_snapshot.iteration || changed_state {
             let style = PlotStyle::from_theme(cx.theme());
+            let first_data = !self.last_snapshot.has_state && snap.has_state;
             if let (Some(x), Some(y)) = (snap.linear.get("x"), snap.linear.get("y")) {
                 self.plot.update(cx, |plot, cx| {
                     plot.set_series(vec![
                         Series::scatter(x.clone(), y.clone()).label("particles"),
                     ]);
                     plot.set_style(style);
+                    if first_data {
+                        let (xmin, xmax) = data_range(x);
+                        let (ymin, ymax) = data_range(y);
+                        plot.set_x_range(xmin, xmax);
+                        plot.set_y_range(ymin, ymax);
+                    }
                     cx.notify();
                 });
             } else if !snap.has_state {
