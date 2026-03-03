@@ -398,7 +398,7 @@ impl Render for DustApp {
                     .bg(cx.theme().primary)
                     .text_color(cx.theme().primary_foreground)
                     .text_sm()
-                    .child("▶")
+                    .child("⊕")
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.send(Command::CreateState);
                         cx.notify();
@@ -457,7 +457,7 @@ impl Render for DustApp {
                         .bg(cx.theme().primary)
                         .text_color(cx.theme().primary_foreground)
                         .text_sm()
-                        .child("›")
+                        .child("▸")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.send(Command::Step);
                             cx.notify();
