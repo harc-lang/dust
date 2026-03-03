@@ -2,9 +2,10 @@
 //!
 //! Parses CLI args, loads config, constructs solver, and dispatches to a frontend.
 
+use crate::command::Command;
 use crate::config::{Checkpoint, SimulationConfig, build_nested, merge};
 use crate::driver::{Driver, DriverState};
-use crate::solver::{Solver, Validate};
+use crate::solver::Solver;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -86,10 +87,9 @@ where
         Mode::Batch => frontend::cli::run(handle),
         Mode::Repl => frontend::repl::run(handle),
         Mode::Tui => {
-            let mut disabled = S::Physics::disabled_config_paths();
-            disabled.extend(S::Initial::disabled_config_paths());
-            disabled.extend(S::Compute::disabled_config_paths());
-            frontend::tui::run(handle, disabled)
+            // TODO: update TUI frontend for Event/Watch API
+            eprintln!("TUI frontend is temporarily disabled");
+            let _ = handle.cmd_tx.send(Command::Quit);
         }
     }
 

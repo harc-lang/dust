@@ -1,7 +1,8 @@
 //! Particle simulation with GPUI visualization.
 
-use driver::command::{Command, Message};
+use driver::command::{Command, DriverMode, Event};
 use driver::config::SimulationConfig;
+use driver::watch::Snapshot;
 use driver::worker::DriverHandle;
 use driver::{Driver, DriverState, PlotData, Solver, StepInfo, Validate};
 use gpui::{
@@ -287,63 +288,53 @@ struct DustApp {
     handle: DriverHandle,
     form: Entity<SchemaForm>,
     plot: Entity<Plot>,
-    running: bool,
-    has_state: bool,
     status_text: String,
-    plot_query_pending: bool,
-    status_query_pending: bool,
+    last_snapshot: Snapshot,
 }
 
 impl DustApp {
-    fn drain_messages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn read_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let snap = self.handle.snapshot.read();
+        let changed_state = snap.has_state != self.last_snapshot.has_state;
+        let _changed_running = snap.mode != self.last_snapshot.mode;
+
+        // Update plot if products changed
+        if snap.iteration != self.last_snapshot.iteration || changed_state {
+            if let (Some(x), Some(y)) = (snap.linear.get("x"), snap.linear.get("y")) {
+                let new_plot = Plot::new()
+                    .grid(true)
+                    .aspect_ratio(1.0)
+                    .x_label("x")
+                    .y_label("y")
+                    .series(Series::scatter(x.clone(), y.clone()).label("particles"));
+                self.plot = cx.new(|_cx| new_plot);
+            } else if !snap.has_state {
+                self.plot = cx.new(|_cx| Plot::new().grid(true).aspect_ratio(1.0));
+            }
+        }
+
+        // Update form filter when state existence changes
+        if changed_state {
+            let has_state = snap.has_state;
+            self.form.update(cx, |form, cx| {
+                form.set_filter(DustFilter { has_state }, window, cx);
+            });
+        }
+
+        self.status_text = snap.status_text.clone();
+        self.last_snapshot = snap;
+
+        // Drain events (low-frequency)
         loop {
-            match self.handle.msg_rx.try_recv() {
-                Ok(Message::StepCompleted { display, .. }) => {
-                    self.status_text = display;
-                    self.status_query_pending = false;
-                }
-                Ok(Message::PlotData { linear, .. }) => {
-                    self.plot_query_pending = false;
-                    if let (Some(x), Some(y)) = (linear.get("x"), linear.get("y")) {
-                        let new_plot = Plot::new()
-                            .grid(true)
-                            .aspect_ratio(1.0)
-                            .x_label("x")
-                            .y_label("y")
-                            .series(Series::scatter(x.clone(), y.clone()).label("particles"));
-                        self.plot = cx.new(|_cx| new_plot);
-                    }
-                }
-                Ok(Message::SimulationDone) => {
-                    self.running = false;
-                    self.status_text = "Simulation done".into();
-                    self.plot_query_pending = true;
-                    self.send(Command::QueryPlotData);
-                }
-                Ok(Message::StateCreated) => {
-                    self.has_state = true;
-                    self.status_text = "State created".into();
-                    self.form.update(cx, |form, cx| {
-                        form.set_filter(DustFilter { has_state: true }, window, cx);
-                    });
-                    self.plot_query_pending = true;
-                    self.send(Command::QueryPlotData);
-                }
-                Ok(Message::StateDestroyed) => {
-                    self.has_state = false;
-                    self.status_text = "State destroyed".into();
-                    self.form.update(cx, |form, cx| {
-                        form.set_filter(DustFilter { has_state: false }, window, cx);
-                    });
-                    self.plot = cx.new(|_cx| Plot::new().grid(true).aspect_ratio(1.0));
-                }
-                Ok(Message::Error(e)) => {
+            match self.handle.event_rx.try_recv() {
+                Ok(Event::Error(e)) => {
                     self.status_text = format!("Error: {}", e);
                 }
-                Ok(Message::ConfigUpdated(result)) => {
-                    if let Err(e) = result {
-                        self.status_text = format!("Config error: {}", e);
-                    }
+                Ok(Event::ConfigUpdated(Err(e))) => {
+                    self.status_text = format!("Config error: {}", e);
+                }
+                Ok(Event::SimulationDone) => {
+                    self.status_text = "Simulation done".into();
                 }
                 Ok(_) => {}
                 Err(TryRecvError::Empty) => break,
@@ -351,17 +342,18 @@ impl DustApp {
             }
         }
 
-        if self.running {
-            if !self.status_query_pending {
-                self.status_query_pending = true;
-                self.send(Command::QueryStatus);
-            }
-            if !self.plot_query_pending {
-                self.plot_query_pending = true;
-                self.send(Command::QueryPlotData);
-            }
+        // Keep rendering while running
+        if self.last_snapshot.mode == DriverMode::Running {
             cx.notify();
         }
+    }
+
+    fn running(&self) -> bool {
+        self.last_snapshot.mode == DriverMode::Running
+    }
+
+    fn has_state(&self) -> bool {
+        self.last_snapshot.has_state
     }
 
     fn send(&self, cmd: Command) {
@@ -371,7 +363,7 @@ impl DustApp {
 
 impl Render for DustApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.drain_messages(window, cx);
+        self.read_snapshot(window, cx);
 
         if self.form.read(cx).is_dirty() {
             let value = self.form.read(cx).to_value();
@@ -379,9 +371,9 @@ impl Render for DustApp {
         }
 
         let status = self.status_text.clone();
-        let running = self.running;
+        let running = self.running();
 
-        let has_state = self.has_state;
+        let has_state = self.has_state();
         let transport = if !has_state {
             // No state: single "▶" button that creates state
             h_flex().child(
@@ -395,8 +387,9 @@ impl Render for DustApp {
                     .text_color(cx.theme().primary_foreground)
                     .text_sm()
                     .child("▶")
-                    .on_click(cx.listener(|this, _, _, _cx| {
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.send(Command::CreateState);
+                        cx.notify();
                     })),
             )
         } else if running {
@@ -412,9 +405,9 @@ impl Render for DustApp {
                     .text_color(cx.theme().primary_foreground)
                     .text_sm()
                     .child("⏸")
-                    .on_click(cx.listener(|this, _, _, _cx| {
-                        this.running = false;
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.send(Command::Pause);
+                        cx.notify();
                     })),
             )
         } else {
@@ -432,10 +425,10 @@ impl Render for DustApp {
                         .text_color(cx.theme().primary_foreground)
                         .text_sm()
                         .child("▶")
-                        .on_click(cx.listener(|this, _, _, _cx| {
-                            this.running = true;
-                            this.send(Command::Run);
-                        })),
+                        .on_click(cx.listener(|this, _, _, cx| {
+                                this.send(Command::Run);
+                                cx.notify();
+                            })),
                 )
                 .child(
                     div()
@@ -453,10 +446,10 @@ impl Render for DustApp {
                         .text_color(cx.theme().primary_foreground)
                         .text_sm()
                         .child("›")
-                        .on_click(cx.listener(|this, _, _, _cx| {
-                            this.send(Command::Step);
-                            this.send(Command::QueryPlotData);
-                        })),
+                        .on_click(cx.listener(|this, _, _, cx| {
+                                this.send(Command::Step);
+                                cx.notify();
+                            })),
                 )
         };
 
@@ -472,9 +465,9 @@ impl Render for DustApp {
                     .text_color(cx.theme().secondary_foreground)
                     .text_xs()
                     .child("✕")
-                    .on_click(cx.listener(|this, _, _, _cx| {
-                        this.running = false;
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.send(Command::DestroyState);
+                        cx.notify();
                     })),
             )
         } else {
@@ -575,11 +568,8 @@ fn main() {
                     handle,
                     form,
                     plot,
-                    running: false,
-                    has_state: false,
                     status_text: "Ready".into(),
-                    plot_query_pending: false,
-                    status_query_pending: false,
+                    last_snapshot: Snapshot::default(),
                 });
 
                 cx.new(|cx| Root::new(app_entity, window, cx))

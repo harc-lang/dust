@@ -1,8 +1,9 @@
 //! Simulation driver
 
-use crate::command::{Command, DriverMode, Message};
+use crate::command::{Command, DriverMode, Event};
 use crate::config::{Checkpoint, SimulationConfig, ensure_output_dir};
 use crate::solver::{PlotData, Solver, StepInfo, Validate};
+use crate::watch::{Snapshot, Watch};
 use serde::{Serialize, de};
 use serde_json::Value;
 use std::path::Path;
@@ -22,7 +23,7 @@ impl<'de> de::Deserialize<'de> for IgnoredProducts {
     }
 }
 
-/// Serializable driver driver_state, stored in checkpoints.
+/// Serializable driver bookkeeping state, stored in checkpoints.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct DriverState {
     pub iteration: i64,
@@ -56,19 +57,19 @@ pub struct Driver<S: Solver> {
     driver_state: DriverState,
     mode: DriverMode,
     schema: Value,
-    /// Buffered step completion info; held until the frontend asks for it.
-    pending_step: Option<Message>,
+    /// Status line from the most recent step.
+    status_text: String,
 }
 
 impl<S: Solver> Driver<S> {
     /// Create a new driver. Writes an initial checkpoint for fresh starts
-    /// and emits any resulting messages.
+    /// and emits any resulting events.
     pub fn new(
         config: SimulationConfig<S>,
         solver: S,
         state: Option<S::State>,
         driver_state: DriverState,
-    ) -> (Self, Vec<Message>) {
+    ) -> (Self, Vec<Event>) {
         let schema = serde_json::to_value(schemars::schema_for!(SimulationConfig<S>)).unwrap();
 
         let mut driver = Driver {
@@ -78,14 +79,14 @@ impl<S: Solver> Driver<S> {
             driver_state,
             mode: DriverMode::Idle,
             schema,
-            pending_step: None,
+            status_text: String::new(),
         };
 
-        let mut msgs = Vec::new();
+        let mut events = Vec::new();
 
         if driver.driver_state.iteration == 0 {
             if let Some(s) = driver.state.take() {
-                msgs.push(driver.write_checkpoint(&s));
+                events.push(driver.write_checkpoint(&s));
                 if let Some(interval) = driver.config.driver.checkpoint_interval {
                     driver.driver_state.next_checkpoint_time += interval;
                 }
@@ -93,8 +94,7 @@ impl<S: Solver> Driver<S> {
             }
         }
 
-        msgs.push(driver.state_info());
-        (driver, msgs)
+        (driver, events)
     }
 
     /// Convenience entry point: delegates to [`crate::app::run`].
@@ -109,182 +109,151 @@ impl<S: Solver> Driver<S> {
         crate::app::run::<S>();
     }
 
-    /// Whether the driver is currently running (wants to be called with Run again).
+    /// Whether the driver is currently running (wants to step continuously).
     pub fn is_running(&self) -> bool {
         self.mode == DriverMode::Running
     }
 
-    /// Process a command, returning any messages produced.
-    pub fn accept(&mut self, cmd: Command) -> Vec<Message> {
-        let mut msgs = Vec::new();
+    /// Write the current observable state into the watch channel.
+    pub fn write_snapshot(&self, watch: &Watch<Snapshot>) {
+        let (linear, planar) = if let Some(state) = &self.state {
+            let prods = self.solver.products(state);
+            (prods.linear_data(), prods.planar_data())
+        } else {
+            (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
+        };
+
+        watch.write(Snapshot {
+            mode: self.mode,
+            has_state: self.state.is_some(),
+            iteration: self.driver_state.iteration,
+            time: self.state.as_ref().map(|s| self.solver.time(s)).unwrap_or(0.0),
+            status_text: self.status_text.clone(),
+            linear,
+            planar,
+        });
+    }
+
+    /// Return the JSON schema for the simulation config.
+    pub fn schema(&self) -> &Value {
+        &self.schema
+    }
+
+    /// Process a command, returning any events produced.
+    pub fn accept(&mut self, cmd: Command) -> Vec<Event> {
+        let mut events = Vec::new();
 
         match cmd {
             Command::Run => {
                 if self.state.is_none() {
-                    msgs.push(Message::Error("no state".into()));
+                    events.push(Event::Error("no state".into()));
                 } else {
-                    let was_running = self.mode == DriverMode::Running;
                     self.mode = DriverMode::Running;
-                    if !was_running {
-                        let s = self.state.as_ref().unwrap();
-                        msgs.push(Message::Status {
-                            mode: DriverMode::Running,
-                            iteration: self.driver_state.iteration,
-                            time: self.solver.time(s),
-                        });
-                    }
-                    self.step_or_finish(&mut msgs);
-                    // Buffer the StepCompleted message instead of sending it
-                    // immediately; the frontend retrieves it via QueryStatus.
-                    if let Some(pos) = msgs.iter().position(|m| matches!(m, Message::StepCompleted { .. })) {
-                        self.pending_step = Some(msgs.remove(pos));
-                    }
+                    self.step_or_finish(&mut events);
                 }
             }
             Command::Pause => {
                 self.mode = DriverMode::Idle;
-                if let Some(ref s) = self.state {
-                    msgs.push(Message::Status {
-                        mode: DriverMode::Idle,
-                        iteration: self.driver_state.iteration,
-                        time: self.solver.time(s),
-                    });
-                    msgs.push(self.state_info());
-                }
             }
             Command::Step => {
                 if let Some(s) = self.state.take() {
                     if !self.solver.finished(&s) {
-                        let (s, step_msgs) = self.do_step(s);
-                        msgs.extend(step_msgs);
+                        let (s, step_events) = self.do_step(s);
+                        events.extend(step_events);
                         self.state = Some(s);
                     } else {
                         self.state = Some(s);
                     }
                     self.mode = DriverMode::Idle;
-                    let s = self.state.as_ref().unwrap();
-                    msgs.push(Message::Status {
-                        mode: DriverMode::Idle,
-                        iteration: self.driver_state.iteration,
-                        time: self.solver.time(s),
-                    });
-                    msgs.push(self.state_info());
                 } else {
-                    msgs.push(Message::Error("no state".into()));
+                    events.push(Event::Error("no state".into()));
                 }
-            }
-            Command::QueryStatus => {
-                if let Some(step) = self.pending_step.take() {
-                    msgs.push(step);
-                }
-                let time = self
-                    .state
-                    .as_ref()
-                    .map(|s| self.solver.time(s))
-                    .unwrap_or(0.0);
-                msgs.push(Message::Status {
-                    mode: self.mode,
-                    iteration: self.driver_state.iteration,
-                    time,
-                });
-                msgs.push(self.state_info());
-            }
-            Command::QueryConfig => {
-                msgs.push(Message::Config(
-                    serde_json::to_value(&self.config).unwrap_or_default(),
-                ));
-            }
-            Command::QueryConfigRon => {
-                msgs.push(self.config_sections());
-            }
-            Command::QuerySchema => {
-                msgs.push(Message::Schema(self.schema.clone()));
             }
             Command::UpdateConfig(patch) => {
-                msgs.extend(self.update_config(patch));
+                events.extend(self.update_config(patch));
             }
             Command::UpdateConfigRon(ron) => {
-                msgs.extend(self.update_config_ron(&ron));
+                events.extend(self.update_config_ron(&ron));
             }
             Command::UpdateConfigSection { section, ron } => {
-                msgs.extend(self.update_config_section(&section, &ron));
+                events.extend(self.update_config_section(&section, &ron));
             }
             Command::CreateState => {
                 if self.state.is_some() {
-                    msgs.push(Message::Error("state already exists".into()));
+                    events.push(Event::Error("state already exists".into()));
                 } else {
                     let s = self.solver.initial();
                     self.driver_state = DriverState::new();
-                    msgs.push(self.write_checkpoint(&s));
+                    events.push(self.write_checkpoint(&s));
                     self.state = Some(s);
-                    msgs.push(Message::StateCreated);
-                    msgs.push(self.state_info());
+                    events.push(Event::StateCreated);
                 }
             }
             Command::DestroyState => {
                 self.state = None;
                 self.mode = DriverMode::Idle;
-                msgs.push(Message::StateDestroyed);
-                msgs.push(self.state_info());
+                self.status_text.clear();
+                events.push(Event::StateDestroyed);
             }
             Command::WriteConfig(path) => {
-                msgs.extend(self.write_config(&path));
+                events.extend(self.write_config(&path));
             }
             Command::Checkpoint => {
                 if let Some(s) = self.state.take() {
-                    msgs.push(self.write_checkpoint(&s));
+                    events.push(self.write_checkpoint(&s));
                     self.state = Some(s);
-                    msgs.push(self.state_info());
                 } else {
-                    msgs.push(Message::Error("no state".into()));
+                    events.push(Event::Error("no state".into()));
                 }
             }
             Command::LoadConfig(path) => {
-                msgs.extend(self.load_config(&path));
+                events.extend(self.load_config(&path));
             }
             Command::LoadCheckpoint(path) => {
-                msgs.extend(self.load_checkpoint(&path));
+                events.extend(self.load_checkpoint(&path));
             }
-            Command::QueryPlotData => {
-                let (linear, planar) = if let Some(state) = &self.state {
-                    let prods = self.solver.products(state);
-                    (prods.linear_data(), prods.planar_data())
-                } else {
-                    (
-                        std::collections::HashMap::new(),
-                        std::collections::HashMap::new(),
-                    )
-                };
-                msgs.push(Message::PlotData { linear, planar });
+            Command::QueryConfig => {
+                events.push(Event::Config(
+                    serde_json::to_value(&self.config).unwrap_or_default(),
+                ));
+            }
+            Command::QueryConfigRon => {
+                events.push(self.config_sections());
+            }
+            Command::QuerySchema => {
+                events.push(Event::Schema(self.schema.clone()));
             }
             Command::Quit => {
-                msgs.push(Message::Finished);
+                events.push(Event::Finished);
             }
         }
 
-        msgs
+        events
     }
 
     // ========================================================================
     // Simulation stepping
     // ========================================================================
 
-    fn step_or_finish(&mut self, msgs: &mut Vec<Message>) {
+    fn step_or_finish(&mut self, events: &mut Vec<Event>) {
         let s = self.state.take().unwrap();
         if !self.solver.finished(&s) {
-            let (s, step_msgs) = self.do_step(s);
-            msgs.extend(step_msgs);
+            let (s, step_events) = self.do_step(s);
+            events.extend(step_events);
             self.state = Some(s);
         } else {
             self.state = Some(s);
-            msgs.push(Message::SimulationDone);
+            events.push(Event::SimulationDone);
             self.mode = DriverMode::Idle;
         }
     }
 
-    fn do_step(&mut self, state: S::State) -> (S::State, Vec<Message>) {
-        let mut msgs = Vec::new();
-        self.maybe_write_checkpoint(&state, &mut msgs);
+    fn do_step(&mut self, state: S::State) -> (S::State, Vec<Event>) {
+        let mut events = Vec::new();
+        self.maybe_write_checkpoint(&state, &mut events);
         let mut dt = self.solver.timestep(&state);
         if let Some(max_dt) = self.time_to_next_checkpoint(self.solver.time(&state)) {
             dt = dt.min(max_dt);
@@ -297,29 +266,21 @@ impl<S: Solver> Driver<S> {
             time: self.solver.time(&state),
             seconds,
         };
-        let display = self.solver.message(&state, &info);
+        self.status_text = self.solver.message(&state, &info);
 
-        msgs.push(Message::StepCompleted {
-            iteration: info.iteration,
-            time: info.time,
-            seconds: info.seconds,
-            display,
-        });
-
-        (state, msgs)
+        (state, events)
     }
 
     // ========================================================================
     // Checkpointing
     // ========================================================================
 
-    fn maybe_write_checkpoint(&mut self, state: &S::State, msgs: &mut Vec<Message>) {
+    fn maybe_write_checkpoint(&mut self, state: &S::State, events: &mut Vec<Event>) {
         if let Some(interval) = self.config.driver.checkpoint_interval {
             let tol = 1e-15;
             if (self.solver.time(state) - self.driver_state.next_checkpoint_time).abs() < tol {
-                msgs.push(self.write_checkpoint(state));
+                events.push(self.write_checkpoint(state));
                 self.driver_state.next_checkpoint_time += interval;
-                msgs.push(self.state_info());
             }
         }
     }
@@ -331,7 +292,7 @@ impl<S: Solver> Driver<S> {
             .map(|_| self.driver_state.next_checkpoint_time - time)
     }
 
-    fn write_checkpoint(&mut self, state: &S::State) -> Message {
+    fn write_checkpoint(&mut self, state: &S::State) -> Event {
         let output_dir = Path::new(&self.config.driver.output_dir);
         ensure_output_dir(output_dir);
 
@@ -356,10 +317,10 @@ impl<S: Solver> Driver<S> {
             });
 
         match result {
-            Ok(()) => Message::CheckpointWritten {
+            Ok(()) => Event::CheckpointWritten {
                 path: name.display().to_string(),
             },
-            Err(e) => Message::Error(e),
+            Err(e) => Event::Error(e),
         }
     }
 
@@ -367,14 +328,14 @@ impl<S: Solver> Driver<S> {
     // Config management
     // ========================================================================
 
-    fn update_config(&mut self, patch: Value) -> Vec<Message> {
+    fn update_config(&mut self, patch: Value) -> Vec<Event> {
         if self.state.is_some() {
             if let Some(obj) = patch.as_object() {
                 let current = serde_json::to_value(&self.config).unwrap_or_default();
                 for section in ["initial", "compute"] {
                     if let Some(incoming) = obj.get(section) {
                         if current.get(section) != Some(incoming) {
-                            return vec![Message::ConfigUpdated(Err(
+                            return vec![Event::ConfigUpdated(Err(
                                 format!("{} config cannot be changed while state exists", section),
                             ))];
                         }
@@ -387,7 +348,7 @@ impl<S: Solver> Driver<S> {
         if has_changes {
             let result = try_update_config(&mut self.config, patch);
             if result.is_err() {
-                return vec![Message::ConfigUpdated(result)];
+                return vec![Event::ConfigUpdated(result)];
             }
         }
 
@@ -400,13 +361,13 @@ impl<S: Solver> Driver<S> {
             );
         }
 
-        vec![Message::ConfigUpdated(Ok(())), self.config_sections()]
+        vec![Event::ConfigUpdated(Ok(())), self.config_sections()]
     }
 
-    fn update_config_ron(&mut self, ron: &str) -> Vec<Message> {
+    fn update_config_ron(&mut self, ron: &str) -> Vec<Event> {
         let new_config: SimulationConfig<S> = match ron::from_str(ron) {
             Ok(c) => c,
-            Err(e) => return vec![Message::ConfigUpdated(Err(format!("{}", e)))],
+            Err(e) => return vec![Event::ConfigUpdated(Err(format!("{}", e)))],
         };
 
         self.config = new_config;
@@ -419,11 +380,11 @@ impl<S: Solver> Driver<S> {
             );
         }
 
-        vec![Message::ConfigUpdated(Ok(())), self.config_sections()]
+        vec![Event::ConfigUpdated(Ok(())), self.config_sections()]
     }
 
-    fn update_config_section(&mut self, section: &str, ron: &str) -> Vec<Message> {
-        let err = |msg: String| vec![Message::ConfigUpdated(Err(msg))];
+    fn update_config_section(&mut self, section: &str, ron: &str) -> Vec<Event> {
+        let err = |msg: String| vec![Event::ConfigUpdated(Err(msg))];
 
         match section {
             "driver" => match ron::from_str(ron) {
@@ -454,30 +415,30 @@ impl<S: Solver> Driver<S> {
             );
         }
 
-        vec![Message::ConfigUpdated(Ok(())), self.config_sections()]
+        vec![Event::ConfigUpdated(Ok(())), self.config_sections()]
     }
 
-    fn write_config(&self, path: &str) -> Vec<Message> {
+    fn write_config(&self, path: &str) -> Vec<Event> {
         match ron::ser::to_string_pretty(&self.config, Self::ron_pretty()) {
             Ok(ron_str) => match std::fs::write(path, &ron_str) {
-                Ok(()) => vec![Message::ConfigWritten { path: path.into() }],
-                Err(e) => vec![Message::Error(format!("write config: {}", e))],
+                Ok(()) => vec![Event::ConfigWritten { path: path.into() }],
+                Err(e) => vec![Event::Error(format!("write config: {}", e))],
             },
-            Err(e) => vec![Message::Error(format!("serialize config: {}", e))],
+            Err(e) => vec![Event::Error(format!("serialize config: {}", e))],
         }
     }
 
-    fn load_config(&mut self, path: &str) -> Vec<Message> {
+    fn load_config(&mut self, path: &str) -> Vec<Event> {
         match std::fs::read_to_string(path) {
-            Err(e) => vec![Message::Error(format!("read {}: {}", path, e))],
+            Err(e) => vec![Event::Error(format!("read {}: {}", path, e))],
             Ok(source) => match ron::from_str::<SimulationConfig<S>>(&source) {
-                Err(e) => vec![Message::Error(format!("parse {}: {}", path, e))],
+                Err(e) => vec![Event::Error(format!("parse {}: {}", path, e))],
                 Ok(new_config) => {
                     self.config = new_config;
                     self.solver = self.new_solver();
                     vec![
-                        Message::ConfigLoaded { path: path.into() },
-                        Message::ConfigUpdated(Ok(())),
+                        Event::ConfigLoaded { path: path.into() },
+                        Event::ConfigUpdated(Ok(())),
                         self.config_sections(),
                     ]
                 }
@@ -485,12 +446,12 @@ impl<S: Solver> Driver<S> {
         }
     }
 
-    fn load_checkpoint(&mut self, path: &str) -> Vec<Message> {
+    fn load_checkpoint(&mut self, path: &str) -> Vec<Event> {
         match std::fs::read(path) {
-            Err(e) => vec![Message::Error(format!("read {}: {}", path, e))],
+            Err(e) => vec![Event::Error(format!("read {}: {}", path, e))],
             Ok(data) => {
                 match rmp_serde::from_slice::<Checkpoint<S, S::State, IgnoredProducts>>(&data) {
-                    Err(e) => vec![Message::Error(format!("parse {}: {}", path, e))],
+                    Err(e) => vec![Event::Error(format!("parse {}: {}", path, e))],
                     Ok(chkpt) => {
                         self.config = chkpt.config;
                         self.driver_state = chkpt.driver;
@@ -498,15 +459,9 @@ impl<S: Solver> Driver<S> {
                         self.mode = DriverMode::Idle;
                         self.solver = self.new_solver();
                         vec![
-                            Message::CheckpointLoaded { path: path.into() },
-                            Message::StateCreated,
-                            Message::Status {
-                                mode: self.mode,
-                                iteration: self.driver_state.iteration,
-                                time: self.solver.time(self.state.as_ref().unwrap()),
-                            },
+                            Event::CheckpointLoaded { path: path.into() },
+                            Event::StateCreated,
                             self.config_sections(),
-                            self.state_info(),
                         ]
                     }
                 }
@@ -518,9 +473,9 @@ impl<S: Solver> Driver<S> {
     // Helpers
     // ========================================================================
 
-    fn config_sections(&self) -> Message {
+    fn config_sections(&self) -> Event {
         let p = Self::ron_pretty();
-        Message::ConfigSections {
+        Event::ConfigSections {
             driver: ron::ser::to_string_pretty(&self.config.driver, p.clone())
                 .unwrap_or_else(|_| "()".into()),
             physics: ron::ser::to_string_pretty(&self.config.physics, p.clone())
@@ -537,18 +492,6 @@ impl<S: Solver> Driver<S> {
             .depth_limit(8)
             .struct_names(true)
             .enumerate_arrays(false)
-    }
-
-    fn state_info(&self) -> Message {
-        let driver_state = self.driver_state.clone();
-        let solver_status = self
-            .state
-            .as_ref()
-            .map(|s| serde_json::to_value(self.solver.status(s)).unwrap_or_default());
-        Message::StateInfo {
-            driver_state,
-            solver_status,
-        }
     }
 
     fn new_solver(&self) -> S {

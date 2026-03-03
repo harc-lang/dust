@@ -3,7 +3,7 @@
 //! Reads commands from stdin, sends them to the driver, prints responses.
 //! Uses rustyline for history, line editing, and tab completion.
 
-use crate::command::{Command, Message};
+use crate::command::{Command, Event};
 use crate::config::{build_nested, merge};
 use crate::worker::DriverHandle;
 use rustyline::completion::{Completer, Pair};
@@ -62,26 +62,18 @@ impl Completer for ReplHelper {
 }
 
 pub fn run(handle: DriverHandle) {
-    let msg_rx = handle.msg_rx;
+    let event_rx = handle.event_rx;
+    let snapshot = handle.snapshot.clone();
 
-    // Spawn a thread to drain and print messages
+    // Spawn a thread to drain and print events
     let printer = std::thread::spawn(move || {
-        while let Ok(msg) = msg_rx.recv() {
-            match msg {
-                Message::StepCompleted { display, .. } => println!("{}", display),
-                Message::SimulationDone => println!("simulation done"),
-                Message::Status {
-                    mode,
-                    iteration,
-                    time,
-                } => println!(
-                    "status: {:?} iteration={} time={:.4e}",
-                    mode, iteration, time
-                ),
-                Message::Config(v) => {
+        while let Ok(event) = event_rx.recv() {
+            match event {
+                Event::SimulationDone => println!("simulation done"),
+                Event::Config(v) => {
                     println!("{}", serde_json::to_string_pretty(&v).unwrap())
                 }
-                Message::ConfigSections {
+                Event::ConfigSections {
                     driver,
                     physics,
                     initial,
@@ -98,50 +90,19 @@ pub fn run(handle: DriverHandle) {
                         println!();
                     }
                 }
-                Message::Schema(v) => {
+                Event::Schema(v) => {
                     println!("{}", serde_json::to_string_pretty(&v).unwrap())
                 }
-                Message::ConfigUpdated(Ok(())) => println!("config updated"),
-                Message::ConfigUpdated(Err(e)) => println!("config update failed: {}", e),
-                Message::CheckpointWritten { path } => println!("wrote {}", path),
-                Message::ConfigWritten { path } => println!("wrote config to {}", path),
-                Message::ConfigLoaded { path } => println!("loaded config from {}", path),
-                Message::CheckpointLoaded { path } => println!("loaded checkpoint from {}", path),
-                Message::StateCreated => println!("state created"),
-                Message::StateDestroyed => println!("state destroyed"),
-                Message::StateInfo {
-                    driver_state,
-                    solver_status,
-                } => {
-                    println!(
-                        "driver: iter={} chkpt={}",
-                        driver_state.iteration, driver_state.checkpoint_number
-                    );
-                    if let Some(v) = solver_status {
-                        println!(
-                            "solver_status: {}",
-                            serde_json::to_string_pretty(&v).unwrap()
-                        );
-                    } else {
-                        println!("solver_status: no state");
-                    }
-                }
-                Message::PlotData { linear, planar } => {
-                    if !linear.is_empty() {
-                        println!("linear data: {} series", linear.len());
-                        for (name, vals) in &linear {
-                            println!("  {}: {} points", name, vals.len());
-                        }
-                    }
-                    if !planar.is_empty() {
-                        println!("planar data: {} fields", planar.len());
-                        for (name, (rows, cols, _)) in &planar {
-                            println!("  {}: {}x{}", name, rows, cols);
-                        }
-                    }
-                }
-                Message::Error(e) => eprintln!("error: {}", e),
-                Message::Finished => {
+                Event::ConfigUpdated(Ok(())) => println!("config updated"),
+                Event::ConfigUpdated(Err(e)) => println!("config update failed: {}", e),
+                Event::CheckpointWritten { path } => println!("wrote {}", path),
+                Event::ConfigWritten { path } => println!("wrote config to {}", path),
+                Event::ConfigLoaded { path } => println!("loaded config from {}", path),
+                Event::CheckpointLoaded { path } => println!("loaded checkpoint from {}", path),
+                Event::StateCreated => println!("state created"),
+                Event::StateDestroyed => println!("state destroyed"),
+                Event::Error(e) => eprintln!("error: {}", e),
+                Event::Finished => {
                     break;
                 }
             }
@@ -167,8 +128,41 @@ pub fn run(handle: DriverHandle) {
                 let cmd = match trimmed {
                     "run" => Command::Run,
                     "pause" => Command::Pause,
-                    "step" => Command::Step,
-                    "status" => Command::QueryStatus,
+                    "step" => {
+                        handle.cmd_tx.send(Command::Step).ok();
+                        // Wait briefly for the step to complete, then print snapshot
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        let snap = snapshot.read();
+                        println!("{}", snap.status_text);
+                        continue;
+                    }
+                    "status" => {
+                        let snap = snapshot.read();
+                        println!(
+                            "status: {:?} iteration={} time={:.4e}",
+                            snap.mode, snap.iteration, snap.time
+                        );
+                        if snap.has_state {
+                            if !snap.status_text.is_empty() {
+                                println!("{}", snap.status_text);
+                            }
+                            if !snap.linear.is_empty() {
+                                println!("linear data: {} series", snap.linear.len());
+                                for (name, vals) in &snap.linear {
+                                    println!("  {}: {} points", name, vals.len());
+                                }
+                            }
+                            if !snap.planar.is_empty() {
+                                println!("planar data: {} fields", snap.planar.len());
+                                for (name, (rows, cols, _)) in &snap.planar {
+                                    println!("  {}: {}x{}", name, rows, cols);
+                                }
+                            }
+                        } else {
+                            println!("no state");
+                        }
+                        continue;
+                    }
                     "config" => Command::QueryConfig,
                     "schema" => Command::QuerySchema,
                     "create" => Command::CreateState,

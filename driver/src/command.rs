@@ -1,8 +1,6 @@
 //! Command/message protocol for the simulation driver.
 
-use crate::driver::DriverState;
 use serde_json::Value;
-use std::collections::HashMap;
 
 /// Commands sent from a frontend to the driver.
 pub enum Command {
@@ -12,14 +10,6 @@ pub enum Command {
     Pause,
     /// Advance exactly one iteration, then return to idle.
     Step,
-    /// Request current status (iteration, time, mode).
-    QueryStatus,
-    /// Request the current config as a JSON value.
-    QueryConfig,
-    /// Request the current config as a RON string.
-    QueryConfigRon,
-    /// Request the JSON schema for the simulation config.
-    QuerySchema,
     /// Apply a partial config update (JSON merge patch).
     UpdateConfig(Value),
     /// Replace the full config from a RON string.
@@ -38,29 +28,24 @@ pub enum Command {
     LoadConfig(String),
     /// Load a checkpoint (.mpk) file from disk.
     LoadCheckpoint(String),
-    /// Request plot data (1D series and 2D fields) from products.
-    QueryPlotData,
+    /// Request the current config as a JSON value.
+    QueryConfig,
+    /// Request the current config as a RON string.
+    QueryConfigRon,
+    /// Request the JSON schema for the simulation config.
+    QuerySchema,
     /// Shut down the driver.
     Quit,
 }
 
-/// Messages sent from the driver back to the frontend.
-pub enum Message {
-    /// Emitted after each completed iteration.
-    StepCompleted {
-        iteration: i64,
-        time: f64,
-        seconds: f64,
-        display: String,
-    },
+/// Low-frequency events sent from the driver to the frontend.
+///
+/// These represent discrete state transitions and responses to commands.
+/// Continuous data (step progress, plot data) flows through [`crate::watch::Watch`]
+/// instead.
+pub enum Event {
     /// The simulation ended naturally (finished returned true).
     SimulationDone,
-    /// Current driver status.
-    Status {
-        mode: DriverMode,
-        iteration: i64,
-        time: f64,
-    },
     /// Response to QueryConfig.
     Config(Value),
     /// Response to QueryConfigRon: four RON strings, one per config section.
@@ -80,22 +65,12 @@ pub enum Message {
     StateCreated,
     /// Simulation state was destroyed.
     StateDestroyed,
-    /// Driver bookkeeping and physics status for display.
-    StateInfo {
-        driver_state: DriverState,
-        solver_status: Option<Value>,
-    },
     /// Config was written to a file.
     ConfigWritten { path: String },
     /// A config file was loaded from disk.
     ConfigLoaded { path: String },
     /// A checkpoint file was loaded from disk.
     CheckpointLoaded { path: String },
-    /// Plot data from products: 1D series and 2D fields.
-    PlotData {
-        linear: HashMap<String, Vec<f64>>,
-        planar: HashMap<String, (usize, usize, Vec<f64>)>,
-    },
     /// A non-fatal error or warning.
     Error(String),
     /// The driver is shutting down.

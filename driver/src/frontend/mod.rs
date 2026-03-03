@@ -1,3 +1,4 @@
 pub mod cli;
 pub mod repl;
-pub mod tui;
+// TODO: update tui module for Event/Watch API
+// pub mod tui;

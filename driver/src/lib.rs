@@ -7,8 +7,10 @@ pub mod driver;
 pub mod format;
 pub mod frontend;
 pub mod solver;
+pub mod watch;
 pub mod worker;
 
 pub use config::{DriverConfig, SimulationConfig, build_nested, merge};
 pub use driver::{Driver, DriverState};
 pub use solver::{PlotData, Solver, StepInfo, Validate};
+pub use watch::{Snapshot, Watch};
