@@ -344,7 +344,7 @@ impl DustApp {
 
         // Keep rendering while running
         if self.last_snapshot.mode == DriverMode::Running {
-            cx.notify();
+            window.request_animation_frame();
         }
     }
 
