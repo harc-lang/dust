@@ -11,7 +11,7 @@ use gpui::{
     Window, WindowOptions, actions, div, px, size,
 };
 use gpui_component::{ActiveTheme, Root, h_flex, scroll::ScrollableElement, v_flex};
-use gpui_plot::{Plot, Series};
+use gpui_plot::{Plot, PlotStyle, Series};
 use gpui_schema::{NodeFilter, SchemaForm};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -298,18 +298,23 @@ impl DustApp {
         let changed_state = snap.has_state != self.last_snapshot.has_state;
         let _changed_running = snap.mode != self.last_snapshot.mode;
 
-        // Update plot if products changed
+        // Update plot data in place (preserves pan/zoom view state)
         if snap.iteration != self.last_snapshot.iteration || changed_state {
+            let style = PlotStyle::from_theme(cx.theme());
             if let (Some(x), Some(y)) = (snap.linear.get("x"), snap.linear.get("y")) {
-                let new_plot = Plot::new()
-                    .grid(true)
-                    .aspect_ratio(1.0)
-                    .x_label("x")
-                    .y_label("y")
-                    .series(Series::scatter(x.clone(), y.clone()).label("particles"));
-                self.plot = cx.new(|_cx| new_plot);
+                self.plot.update(cx, |plot, cx| {
+                    plot.set_series(vec![
+                        Series::scatter(x.clone(), y.clone()).label("particles"),
+                    ]);
+                    plot.set_style(style);
+                    cx.notify();
+                });
             } else if !snap.has_state {
-                self.plot = cx.new(|_cx| Plot::new().grid(true).aspect_ratio(1.0));
+                self.plot.update(cx, |plot, cx| {
+                    plot.set_series(vec![]);
+                    plot.set_style(style);
+                    cx.notify();
+                });
             }
         }
 
@@ -426,9 +431,9 @@ impl Render for DustApp {
                         .text_sm()
                         .child("▶")
                         .on_click(cx.listener(|this, _, _, cx| {
-                                this.send(Command::Run);
-                                cx.notify();
-                            })),
+                            this.send(Command::Run);
+                            cx.notify();
+                        })),
                 )
                 .child(
                     div()
@@ -447,9 +452,9 @@ impl Render for DustApp {
                         .text_sm()
                         .child("›")
                         .on_click(cx.listener(|this, _, _, cx| {
-                                this.send(Command::Step);
-                                cx.notify();
-                            })),
+                            this.send(Command::Step);
+                            cx.notify();
+                        })),
                 )
         };
 
@@ -562,7 +567,8 @@ fn main() {
                     form.set_filter(DustFilter { has_state: false }, window, cx);
                     form
                 });
-                let plot = cx.new(|_cx| Plot::new().grid(true).aspect_ratio(1.0));
+                let style = PlotStyle::from_theme(cx.theme());
+                let plot = cx.new(|_cx| Plot::new().grid(true).aspect_ratio(1.0).style(style));
 
                 let app_entity = cx.new(|_cx| DustApp {
                     handle,
