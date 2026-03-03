@@ -19,6 +19,23 @@ use std::collections::HashMap;
 use std::sync::mpsc::TryRecvError;
 
 // ============================================================================
+// Log message types
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LogLevel {
+    Info,
+    Error,
+    Iteration,
+}
+
+#[derive(Debug, Clone)]
+struct LogMessage {
+    text: String,
+    level: LogLevel,
+}
+
+// ============================================================================
 // Config types
 // ============================================================================
 
@@ -292,6 +309,7 @@ actions!(
         DestroyState,
         WriteCheckpoint,
         WriteConfig,
+        ToggleLog,
     ]
 );
 
@@ -301,9 +319,39 @@ struct DustApp {
     plot: Entity<Plot>,
     status_text: String,
     last_snapshot: Snapshot,
+    log_lines: Vec<LogMessage>,
+    last_message: Option<LogMessage>,
+    show_log: bool,
 }
 
 impl DustApp {
+    fn log_info(&mut self, msg: impl Into<String>) {
+        let msg = LogMessage {
+            text: msg.into(),
+            level: LogLevel::Info,
+        };
+        self.last_message = Some(msg.clone());
+        self.log_lines.push(msg);
+    }
+
+    fn log_error(&mut self, msg: impl Into<String>) {
+        let msg = LogMessage {
+            text: msg.into(),
+            level: LogLevel::Error,
+        };
+        self.last_message = Some(msg.clone());
+        self.log_lines.push(msg);
+    }
+
+    fn log_iteration(&mut self, msg: impl Into<String>) {
+        let msg = LogMessage {
+            text: msg.into(),
+            level: LogLevel::Iteration,
+        };
+        self.last_message = Some(msg.clone());
+        self.log_lines.push(msg);
+    }
+
     fn read_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let snap = self.handle.snapshot.read();
         let changed_state = snap.has_state != self.last_snapshot.has_state;
@@ -344,6 +392,11 @@ impl DustApp {
             });
         }
 
+        // Log iteration messages when iteration advances
+        if snap.iteration != self.last_snapshot.iteration && !snap.status_text.is_empty() {
+            self.log_iteration(snap.status_text.clone());
+        }
+
         self.status_text = snap.status_text.clone();
         self.last_snapshot = snap;
 
@@ -351,13 +404,34 @@ impl DustApp {
         loop {
             match self.handle.event_rx.try_recv() {
                 Ok(Event::Error(e)) => {
-                    self.status_text = format!("Error: {}", e);
+                    self.log_error(format!("Error: {}", e));
+                }
+                Ok(Event::ConfigUpdated(Ok(()))) => {
+                    self.log_info("config updated");
                 }
                 Ok(Event::ConfigUpdated(Err(e))) => {
-                    self.status_text = format!("Config error: {}", e);
+                    self.log_error(format!("Config error: {}", e));
                 }
                 Ok(Event::SimulationDone) => {
-                    self.status_text = "Simulation done".into();
+                    self.log_info("simulation done");
+                }
+                Ok(Event::CheckpointWritten { path }) => {
+                    self.log_info(format!("wrote {}", path));
+                }
+                Ok(Event::StateCreated) => {
+                    self.log_info("state created");
+                }
+                Ok(Event::StateDestroyed) => {
+                    self.log_info("state destroyed");
+                }
+                Ok(Event::ConfigWritten { path }) => {
+                    self.log_info(format!("wrote config to {}", path));
+                }
+                Ok(Event::ConfigLoaded { path }) => {
+                    self.log_info(format!("loaded config from {}", path));
+                }
+                Ok(Event::CheckpointLoaded { path }) => {
+                    self.log_info(format!("loaded checkpoint from {}", path));
                 }
                 Ok(_) => {}
                 Err(TryRecvError::Empty) => break,
@@ -394,130 +468,193 @@ impl Render for DustApp {
             self.send(Command::UpdateConfig(value));
         }
 
-        let status = self.status_text.clone();
         let running = self.running();
         let has_state = self.has_state();
+        let show_log = self.show_log;
+        let mono = cx.theme().mono_font_family.clone();
 
-        // Single fixed-width transport button: ⊕ create / ▶ play / ⏸ pause
-        // Shift-click for single step when paused with state
-        let transport_icon = if !has_state {
-            "⊕"
-        } else if running {
-            "⏸"
-        } else {
-            "▶"
-        };
-
-        let transport = div()
-            .id("transport-btn")
-            .w(px(28.0))
-            .py_1()
-            .rounded_md()
-            .cursor_pointer()
-            .text_center()
-            .bg(cx.theme().primary)
-            .text_color(cx.theme().primary_foreground)
-            .text_sm()
-            .child(transport_icon)
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, _cx| {
-                let shift = event.modifiers().shift;
-                if !this.has_state() {
-                    this.send(Command::CreateState);
-                } else if this.running() {
-                    this.send(Command::Pause);
-                } else if shift {
-                    this.send(Command::Step);
-                } else {
-                    this.send(Command::Run);
-                }
-            }));
-
-        // Always-visible destroy button, dimmed when no state
-        let (destroy_bg, destroy_fg) = if has_state {
-            (cx.theme().secondary, cx.theme().secondary_foreground)
-        } else {
-            (
-                cx.theme().secondary.opacity(0.3),
-                cx.theme().muted_foreground.opacity(0.3),
-            )
-        };
-        let destroy = div()
-            .id("destroy-btn")
-            .w(px(28.0))
-            .py_1()
-            .rounded_md()
-            .cursor_pointer()
-            .text_center()
-            .text_xs()
-            .bg(destroy_bg)
-            .text_color(destroy_fg)
-            .child("✕")
-            .on_click(cx.listener(move |this, _, _, _cx| {
-                if this.has_state() {
-                    this.send(Command::DestroyState);
-                }
-            }));
-
-        // Footer hint bar
+        // Footer hint bar - build hints with actions for clickability
         let key_color = gpui::Hsla::from(cx.theme().warning);
         let text_color = gpui::Hsla::from(cx.theme().muted_foreground);
         let bg_color = cx.theme().title_bar;
 
-        let mut hints: Vec<(&str, &str)> = Vec::new();
-        if running {
-            hints.push(("p", "pause"));
-        } else if has_state {
-            hints.push(("p", "play"));
-        }
-        if has_state && !running {
-            hints.push(("s", "step"));
-        }
-        if !has_state {
-            hints.push(("n", "new"));
-        }
-        if has_state && !running {
-            hints.push(("d", "destroy"));
-        }
-        if has_state && !running {
-            hints.push(("c", "checkpoint"));
-            hints.push(("w", "write-cfg"));
+        // Each hint: (key_label, description, element_id, action_tag)
+        // action_tag is a short string used to dispatch the right command on click
+        struct Hint {
+            key: &'static str,
+            desc: &'static str,
+            id: &'static str,
+            action: &'static str,
         }
 
-        let footer = h_flex()
-            .h(px(22.0))
-            .px_2()
+        let mut hints: Vec<Hint> = Vec::new();
+        if running {
+            hints.push(Hint { key: "p", desc: "pause", id: "hint-p", action: "pause" });
+        } else if has_state {
+            hints.push(Hint { key: "p", desc: "play", id: "hint-p", action: "play" });
+        }
+        if has_state && !running {
+            hints.push(Hint { key: "s", desc: "step", id: "hint-s", action: "step" });
+        }
+        if !has_state {
+            hints.push(Hint { key: "n", desc: "new", id: "hint-n", action: "new" });
+        }
+        if has_state && !running {
+            hints.push(Hint { key: "d", desc: "destroy", id: "hint-d", action: "destroy" });
+        }
+        if has_state && !running {
+            hints.push(Hint { key: "c", desc: "checkpoint", id: "hint-c", action: "checkpoint" });
+            hints.push(Hint { key: "w", desc: "write-cfg", id: "hint-w", action: "write-cfg" });
+        }
+        hints.push(Hint {
+            key: "l",
+            desc: if show_log { "plot" } else { "log" },
+            id: "hint-l",
+            action: "toggle-log",
+        });
+
+        let footer_hints = h_flex()
             .gap_0p5()
+            .items_center()
+            .flex_shrink_0()
+            .children(hints.into_iter().enumerate().map(|(i, hint)| {
+                let action = hint.action;
+                div()
+                    .id(hint.id)
+                    .cursor_pointer()
+                    .child(
+                        h_flex().children({
+                            let mut parts = Vec::new();
+                            if i > 0 {
+                                parts.push(
+                                    div()
+                                        .text_xs()
+                                        .font_family(mono.clone())
+                                        .text_color(text_color)
+                                        .child(" ")
+                                        .into_any_element(),
+                                );
+                            }
+                            parts.push(
+                                div()
+                                    .text_xs()
+                                    .font_family(mono.clone())
+                                    .text_color(key_color)
+                                    .child(hint.key)
+                                    .into_any_element(),
+                            );
+                            parts.push(
+                                div()
+                                    .text_xs()
+                                    .font_family(mono.clone())
+                                    .text_color(text_color)
+                                    .child(format!(":{}", hint.desc))
+                                    .into_any_element(),
+                            );
+                            parts
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, _cx| {
+                        match action {
+                            "pause" => this.send(Command::Pause),
+                            "play" => this.send(Command::Run),
+                            "step" => this.send(Command::Step),
+                            "new" => this.send(Command::CreateState),
+                            "destroy" => this.send(Command::DestroyState),
+                            "checkpoint" => this.send(Command::Checkpoint),
+                            "write-cfg" => this.send(Command::WriteConfig("config.ron".into())),
+                            "toggle-log" => this.show_log = !this.show_log,
+                            _ => {}
+                        }
+                    }))
+                    .into_any_element()
+            }));
+
+        // Right-hand side: iteration info
+        let iteration_text = if has_state {
+            format!(
+                "[{:06}] t={:.6e}",
+                self.last_snapshot.iteration, self.last_snapshot.time
+            )
+        } else {
+            String::new()
+        };
+
+        // Last message with color
+        let last_msg_element = if let Some(ref msg) = self.last_message {
+            let color = match msg.level {
+                LogLevel::Info => gpui::Hsla::from(cx.theme().success),
+                LogLevel::Error => gpui::Hsla::from(cx.theme().danger),
+                LogLevel::Iteration => text_color,
+            };
+            div()
+                .text_xs()
+                .font_family(mono.clone())
+                .text_color(color)
+                .child(msg.text.clone())
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+
+        let footer = h_flex()
+            .h(px(30.0))
+            .px_2()
             .items_center()
             .border_t_1()
             .border_color(cx.theme().border)
             .bg(bg_color)
-            .children(hints.into_iter().enumerate().flat_map(|(i, (key, desc))| {
-                let mut spans = Vec::new();
-                if i > 0 {
-                    spans.push(
+            .child(footer_hints)
+            .child(div().flex_1()) // spacer
+            .child(
+                h_flex()
+                    .gap_3()
+                    .flex_shrink_0()
+                    .items_center()
+                    .child(last_msg_element)
+                    .child(
                         div()
                             .text_xs()
+                            .font_family(mono.clone())
                             .text_color(text_color)
-                            .child(" ")
-                            .into_any_element(),
-                    );
-                }
-                spans.push(
+                            .child(iteration_text),
+                    ),
+            );
+
+        // Log view
+        let log_view = {
+            let log_lines = self.log_lines.clone();
+            div()
+                .flex_1()
+                .size_full()
+                .overflow_y_scrollbar()
+                .p_2()
+                .bg(cx.theme().background)
+                .children(log_lines.into_iter().map(|msg| {
+                    let color = match msg.level {
+                        LogLevel::Info => gpui::Hsla::from(cx.theme().success),
+                        LogLevel::Error => gpui::Hsla::from(cx.theme().danger),
+                        LogLevel::Iteration => gpui::Hsla::from(cx.theme().muted_foreground),
+                    };
                     div()
                         .text_xs()
-                        .text_color(key_color)
-                        .child(format!("{}", key))
-                        .into_any_element(),
-                );
-                spans.push(
-                    div()
-                        .text_xs()
-                        .text_color(text_color)
-                        .child(format!(":{}", desc))
-                        .into_any_element(),
-                );
-                spans
-            }));
+                        .font_family(mono.clone())
+                        .text_color(color)
+                        .child(msg.text)
+                        .into_any_element()
+                }))
+        };
+
+        // Right panel: either plot or log
+        let right_panel = if show_log {
+            log_view.into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .size_full()
+                .child(self.plot.clone())
+                .into_any_element()
+        };
 
         v_flex()
             .size_full()
@@ -556,28 +693,13 @@ impl Render for DustApp {
                     this.send(Command::WriteConfig("config.ron".into()));
                 }
             }))
+            .on_action(cx.listener(|this, _: &ToggleLog, _, cx| {
+                if !this.editing(cx) {
+                    this.show_log = !this.show_log;
+                }
+            }))
             .child(
-                // Toolbar
-                h_flex()
-                    .h(px(36.0))
-                    .px_2()
-                    .gap_2()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(transport)
-                    .child(destroy)
-                    .child(
-                        div()
-                            .pl_4()
-                            .text_xs()
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .text_color(cx.theme().muted_foreground)
-                            .child(status),
-                    ),
-            )
-            .child(
-                // Main content: config panel + plot
+                // Main content: config panel + plot/log
                 h_flex()
                     .flex_1()
                     .size_full()
@@ -589,7 +711,7 @@ impl Render for DustApp {
                             .overflow_y_scrollbar()
                             .child(self.form.clone()),
                     )
-                    .child(div().flex_1().size_full().child(self.plot.clone())),
+                    .child(right_panel),
             )
             .child(footer)
     }
@@ -624,6 +746,7 @@ fn main() {
             KeyBinding::new("d", DestroyState, None),
             KeyBinding::new("c", WriteCheckpoint, None),
             KeyBinding::new("w", WriteConfig, None),
+            KeyBinding::new("l", ToggleLog, None),
         ]);
         cx.set_menus(vec![Menu {
             name: "Dust".into(),
@@ -674,6 +797,9 @@ fn main() {
                     plot,
                     status_text: "Ready".into(),
                     last_snapshot: Snapshot::default(),
+                    log_lines: Vec::new(),
+                    last_message: None,
+                    show_log: false,
                 });
 
                 cx.new(|cx| Root::new(app_entity, window, cx))
