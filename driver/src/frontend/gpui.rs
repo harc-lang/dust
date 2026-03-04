@@ -105,17 +105,41 @@ impl DriverLog {
         self.push(LogLevel::Iteration, msg.into());
     }
 
-    /// Drain all pending [`Event`]s into log entries.
-    pub fn drain_events(&mut self, rx: &Receiver<Event>) {
+    /// Drain all pending [`Event`]s, logging them and returning any that
+    /// the application needs to handle (config/schema updates).
+    pub fn drain_events(&mut self, rx: &Receiver<Event>) -> Vec<Event> {
+        let mut app_events = Vec::new();
         loop {
             match rx.try_recv() {
-                Ok(ev) => self.handle_event(ev),
+                Ok(ev) => {
+                    self.log_event(&ev);
+                    if Self::is_app_event(&ev) {
+                        app_events.push(ev);
+                    }
+                }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
         }
+        app_events
     }
 
-    fn handle_event(&mut self, event: Event) {
+    /// Returns true for events the application may need to act on
+    /// (config data, schema, load confirmations).
+    fn is_app_event(event: &Event) -> bool {
+        matches!(
+            event,
+            Event::Config(_)
+                | Event::ConfigSections { .. }
+                | Event::Schema(_)
+                | Event::ConfigUpdated(_)
+                | Event::ConfigLoaded { .. }
+                | Event::CheckpointLoaded { .. }
+                | Event::StateCreated
+                | Event::StateDestroyed
+        )
+    }
+
+    fn log_event(&mut self, event: &Event) {
         match event {
             Event::Error(e) => self.log_error(format!("error: {e}")),
             Event::ConfigUpdated(Ok(())) => self.log_info("config updated"),

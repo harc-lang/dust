@@ -8,8 +8,9 @@ gpui-plot = { git = "https://github.com/harc-lang/gpui-plot.git" }
 gpui-schema = { git = "https://github.com/harc-lang/gpui-schema.git" }
 driver = { path = "driver", features = ["gpui"] }
 gpui = "0.2"
-gpui-component = "0.5"
+gpui-component = { version = "0.5", features = ["tree-sitter-languages"] }
 anyhow = "1"
 schemars = { version = "1", features = ["derive"] }
+ron = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -4,24 +4,46 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use driver::command::Command;
+use driver::command::{Command, Event as DriverEvent};
 use driver::config::SimulationConfig;
-use driver::gpui_frontend::{
-    self, CreateState, DestroyState, DriverFooter, DriverLog, Quit, SnapshotReader, Step,
-    ToggleLog, ToggleRun, WriteCheckpoint, WriteConfig,
-};
+use driver::gpui_frontend::{DriverFooter, DriverLog, Quit, SnapshotReader};
 use driver::worker::DriverHandle;
 use driver::{Action, CliArgs, Driver, DriverState, Mode, PlotData, Solver, StepInfo, Validate};
 use gpui::{
     App, AppContext as _, Application, Context, Entity, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, Menu, MenuItem, ParentElement, Render,
+    InteractiveElement as _, IntoElement, KeyDownEvent, Menu, MenuItem, ParentElement, Render,
     StatefulInteractiveElement as _, Styled, Window, WindowOptions, div, px, size,
 };
-use gpui_component::{ActiveTheme, Root, h_flex, scroll::ScrollableElement, v_flex};
+use gpui_component::{
+    ActiveTheme, Root, h_flex,
+    input::{Input, InputState},
+    scroll::ScrollableElement,
+    tab::TabBar,
+    v_flex,
+};
 use gpui_plot::{Plot, PlotStyle, Series, data_range};
 use gpui_schema::{NodeFilter, SchemaForm};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+// ============================================================================
+// Left panel tab
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeftTab {
+    Config,
+    Editor,
+}
+
+/// Which widget last sent a config update to the driver.
+/// Used to avoid echoing changes back to the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigSource {
+    Form,
+    Editor,
+    Driver,
+}
 
 // ============================================================================
 // Config types
@@ -291,10 +313,14 @@ struct DustApp {
     handle: DriverHandle,
     form: Entity<SchemaForm>,
     plot: Entity<Plot>,
+    editor: Entity<InputState>,
     focus_handle: FocusHandle,
+    schema: schemars::Schema,
     snapshot_reader: SnapshotReader,
     log: DriverLog,
     show_log: Rc<Cell<bool>>,
+    left_tab: LeftTab,
+    config_source: ConfigSource,
 }
 
 impl Focusable for DustApp {
@@ -305,12 +331,17 @@ impl Focusable for DustApp {
 
 impl DustApp {
     /// Read the latest snapshot, diff it, drain events, and perform
-    /// app-specific updates (plot data, config filter).
+    /// app-specific updates (plot data, config filter, editor/form sync).
     fn read_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let diff = self.snapshot_reader.update(&self.handle.snapshot);
 
-        // Drain events into the log (generic)
-        self.log.drain_events(&self.handle.event_rx);
+        // Drain events — log handles logging, we get back app-relevant ones
+        let app_events = self.log.drain_events(&self.handle.event_rx);
+
+        // Process app events (config sync, etc.)
+        for event in app_events {
+            self.handle_app_event(event, window, cx);
+        }
 
         // Log iteration messages when iteration advances
         if diff.iteration_advanced && !self.snapshot_reader.status_text().is_empty() {
@@ -365,12 +396,95 @@ impl DustApp {
         self.snapshot_reader.has_state()
     }
 
-    fn editing(&self, cx: &Context<Self>) -> bool {
+    fn editing(&self, window: &Window, cx: &Context<Self>) -> bool {
         self.form.read(cx).editing()
+            || (self.left_tab == LeftTab::Editor
+                && self.editor.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    fn editor_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
+        self.left_tab == LeftTab::Editor
+            && self.editor.read(cx).focus_handle(cx).is_focused(window)
     }
 
     fn send(&self, cmd: Command) {
         let _ = self.handle.cmd_tx.send(cmd);
+    }
+
+    /// Handle an app-level event returned by `drain_events`.
+    fn handle_app_event(
+        &mut self,
+        event: DriverEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            // Config sections (RON) — update the editor unless it was the source
+            DriverEvent::ConfigSections {
+                driver,
+                physics,
+                initial,
+                compute,
+            } => {
+                if self.config_source != ConfigSource::Editor {
+                    let ron = format!(
+                        "SimulationConfig(\n    driver: {driver},\n    physics: {physics},\n    initial: {initial},\n    compute: {compute},\n)"
+                    );
+                    self.editor.update(cx, |editor, cx| {
+                        editor.set_value(ron, window, cx);
+                    });
+                }
+                self.config_source = ConfigSource::Driver;
+            }
+            // Full config JSON — update the form unless it was the source
+            DriverEvent::Config(value) => {
+                if self.config_source != ConfigSource::Form {
+                    let form = cx.new(|cx| {
+                        let mut form = SchemaForm::new(&self.schema, &value, window, cx);
+                        form.set_filter(
+                            DustFilter {
+                                has_state: self.snapshot_reader.has_state(),
+                            },
+                            window,
+                            cx,
+                        );
+                        form
+                    });
+                    self.form = form;
+                }
+                self.config_source = ConfigSource::Driver;
+            }
+            // Config update result — on error from editor, don't overwrite editor text
+            DriverEvent::ConfigUpdated(Err(_)) => {
+                // Error already logged by DriverLog. Reset source so next
+                // successful update will sync both widgets.
+                self.config_source = ConfigSource::Driver;
+            }
+            DriverEvent::ConfigUpdated(Ok(())) => {
+                // Success — the ConfigSections event that follows will sync the editor
+            }
+            // State created/destroyed — request fresh config to sync both widgets
+            DriverEvent::StateCreated | DriverEvent::StateDestroyed => {
+                self.send(Command::QueryConfig);
+                self.send(Command::QueryConfigRon);
+            }
+            // Config/checkpoint loaded — request both representations
+            DriverEvent::ConfigLoaded { .. } | DriverEvent::CheckpointLoaded { .. } => {
+                self.config_source = ConfigSource::Driver;
+                self.send(Command::QueryConfig);
+                self.send(Command::QueryConfigRon);
+            }
+            _ => {}
+        }
+    }
+
+    /// Send the editor's RON content to the driver as a config update.
+    fn apply_editor_config(&mut self, cx: &mut Context<Self>) {
+        let ron = self.editor.read(cx).value().to_string();
+        self.config_source = ConfigSource::Editor;
+        self.send(Command::UpdateConfigRon(ron));
+        // Also request the JSON form so the schema form gets updated
+        self.send(Command::QueryConfig);
     }
 }
 
@@ -380,6 +494,7 @@ impl Render for DustApp {
 
         if self.form.read(cx).is_dirty() {
             let value = self.form.read(cx).to_value();
+            self.config_source = ConfigSource::Form;
             self.send(Command::UpdateConfig(value));
         }
 
@@ -396,6 +511,44 @@ impl Render for DustApp {
                 .into_any_element()
         };
 
+        // Left panel: tab bar + content
+        let tab_idx = match self.left_tab {
+            LeftTab::Config => 0,
+            LeftTab::Editor => 1,
+        };
+        let left_content = match self.left_tab {
+            LeftTab::Config => div()
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scrollbar()
+                .child(self.form.clone())
+                .into_any_element(),
+            LeftTab::Editor => div()
+                .flex_1()
+                .min_h_0()
+                .font_family(cx.theme().mono_font_family.clone())
+                .child(Input::new(&self.editor).h_full())
+                .into_any_element(),
+        };
+        let left_panel = v_flex()
+            .w(px(400.0))
+            .h_full()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .child(
+                TabBar::new("left-tabs")
+                    .child("Config")
+                    .child("Editor")
+                    .selected_index(tab_idx)
+                    .on_click(cx.listener(|this, idx: &usize, _window, _cx| {
+                        this.left_tab = match idx {
+                            0 => LeftTab::Config,
+                            _ => LeftTab::Editor,
+                        };
+                    })),
+            )
+            .child(left_content);
+
         // Footer (generic driver widget)
         let cmd_tx = self.handle.cmd_tx.clone();
         let footer = DriverFooter::new(&self.snapshot_reader, &self.log, self.show_log.clone())
@@ -409,76 +562,66 @@ impl Render for DustApp {
             .id("dust-app-root")
             .track_focus(&self.focus_handle)
             .size_full()
-            .on_action(cx.listener(|this, _: &ToggleRun, _, cx| {
-                if this.editing(cx) {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                // Cmd+S: apply editor config (works even when editor is focused)
+                if event.keystroke.key.as_str() == "s"
+                    && event.keystroke.modifiers.platform
+                {
+                    if this.editor_focused(window, cx) {
+                        this.apply_editor_config(cx);
+                    }
                     return;
                 }
-                if !this.has_state() {
+                if this.editing(window, cx) {
                     return;
                 }
-                if this.running() {
-                    this.send(Command::Pause);
-                } else {
-                    this.send(Command::Run);
+                let key = event.keystroke.key.as_str();
+                match key {
+                    "p" => {
+                        if !this.has_state() {
+                            return;
+                        }
+                        if this.running() {
+                            this.send(Command::Pause);
+                        } else {
+                            this.send(Command::Run);
+                        }
+                    }
+                    "s" => {
+                        if this.has_state() && !this.running() {
+                            this.send(Command::Step);
+                        }
+                    }
+                    "n" => {
+                        if !this.has_state() {
+                            this.send(Command::CreateState);
+                        }
+                    }
+                    "d" => {
+                        if this.has_state() && !this.running() {
+                            this.send(Command::DestroyState);
+                        }
+                    }
+                    "c" => {
+                        if this.has_state() && !this.running() {
+                            this.send(Command::Checkpoint);
+                        }
+                    }
+                    "w" => {
+                        this.send(Command::WriteConfig("config.ron".into()));
+                    }
+                    "l" => {
+                        this.show_log.set(!this.show_log.get());
+                    }
+                    _ => {}
                 }
-            }))
-            .on_action(cx.listener(|this, _: &Step, _, cx| {
-                if this.editing(cx) {
-                    return;
-                }
-                if this.has_state() && !this.running() {
-                    this.send(Command::Step);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &CreateState, _, cx| {
-                if this.editing(cx) {
-                    return;
-                }
-                if !this.has_state() {
-                    this.send(Command::CreateState);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &DestroyState, _, cx| {
-                if this.editing(cx) {
-                    return;
-                }
-                if this.has_state() && !this.running() {
-                    this.send(Command::DestroyState);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &WriteCheckpoint, _, cx| {
-                if this.editing(cx) {
-                    return;
-                }
-                if this.has_state() && !this.running() {
-                    this.send(Command::Checkpoint);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &WriteConfig, _, cx| {
-                if this.editing(cx) {
-                    return;
-                }
-                this.send(Command::WriteConfig("config.ron".into()));
-            }))
-            .on_action(cx.listener(|this, _: &ToggleLog, _, cx| {
-                if this.editing(cx) {
-                    return;
-                }
-                this.show_log.set(!this.show_log.get());
             }))
             .child(
                 // Main content: config panel + plot/log
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(
-                        div()
-                            .w(px(400.0))
-                            .border_r_1()
-                            .border_color(cx.theme().border)
-                            .overflow_y_scrollbar()
-                            .child(self.form.clone()),
-                    )
+                    .child(left_panel)
                     .child(
                         div()
                             .id("right-panel")
@@ -522,7 +665,9 @@ fn main() {
         gpui_schema::init(cx);
 
         cx.on_action(|_: &Quit, cx| cx.quit());
-        gpui_frontend::register_keybindings(cx);
+        // Only register cmd-q globally; single-letter shortcuts are
+        // handled via on_key_down so they don't steal from the editor.
+        cx.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
 
         cx.set_menus(vec![Menu {
             name: "Dust".into(),
@@ -567,6 +712,22 @@ fn main() {
                 let style = PlotStyle::from_theme(cx.theme());
                 let plot = cx.new(|_cx| Plot::new().grid(true).aspect_ratio(1.0).style(style));
 
+                let initial_ron = ron::ser::to_string_pretty(
+                    &config,
+                    ron::ser::PrettyConfig::new()
+                        .depth_limit(8)
+                        .struct_names(true)
+                        .enumerate_arrays(false),
+                )
+                .unwrap_or_default();
+                let editor = cx.new(|cx| {
+                    let mut state = InputState::new(window, cx)
+                        .code_editor("rust")
+                        .line_number(true);
+                    state.set_value(initial_ron, window, cx);
+                    state
+                });
+
                 let app_entity = cx.new(|cx| {
                     let focus_handle = cx.focus_handle();
                     focus_handle.focus(window);
@@ -574,10 +735,14 @@ fn main() {
                         handle,
                         form,
                         plot,
+                        editor,
                         focus_handle,
+                        schema,
                         snapshot_reader: SnapshotReader::new(),
                         log: DriverLog::new(),
                         show_log: Rc::new(Cell::new(false)),
+                        left_tab: LeftTab::Config,
+                        config_source: ConfigSource::Driver,
                     }
                 });
 
