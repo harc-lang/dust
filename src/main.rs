@@ -15,8 +15,9 @@ use gpui::{
     StatefulInteractiveElement as _, Styled, Window, WindowOptions, div, px, size,
 };
 use gpui_component::{
-    ActiveTheme, Root, h_flex,
+    ActiveTheme, Root,
     input::{Input, InputState},
+    resizable::{h_resizable, resizable_panel},
     scroll::ScrollableElement,
     tab::TabBar,
     v_flex,
@@ -529,15 +530,13 @@ impl Render for DustApp {
             LeftTab::Editor => div()
                 .flex_1()
                 .min_h_0()
+                .size_full()
                 .font_family(cx.theme().mono_font_family.clone())
-                .child(Input::new(&self.editor).h_full())
+                .child(Input::new(&self.editor).w_full().h_full())
                 .into_any_element(),
         };
         let left_panel = v_flex()
-            .w(px(400.0))
-            .h_full()
-            .border_r_1()
-            .border_color(cx.theme().border)
+            .size_full()
             .child(
                 TabBar::new("left-tabs")
                     .child("Config")
@@ -620,21 +619,23 @@ impl Render for DustApp {
                 }
             }))
             .child(
-                // Main content: config panel + plot/log
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(left_panel)
+                // Main content: resizable config panel + plot/log
+                h_resizable("main-split")
                     .child(
+                        resizable_panel()
+                            .size(px(400.0))
+                            .size_range(px(150.0)..px(800.0))
+                            .child(left_panel),
+                    )
+                    .child(resizable_panel().child(
                         div()
                             .id("right-panel")
-                            .flex_1()
                             .size_full()
                             .on_click(move |_, window, _cx| {
                                 focus_handle.focus(window);
                             })
                             .child(right_panel),
-                    ),
+                    )),
             )
             .child(
                 div()
