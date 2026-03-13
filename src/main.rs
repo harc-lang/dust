@@ -1,5 +1,7 @@
 //! Particle simulation with GPUI visualization.
 
+use std::f64::consts::PI;
+
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -14,6 +16,7 @@ use gpui::{
     InteractiveElement as _, IntoElement, KeyDownEvent, Menu, MenuItem, ParentElement, Render,
     StatefulInteractiveElement as _, Styled, Window, WindowOptions, div, px, size,
 };
+// use gpui_component::switch::{self, Switch};
 use gpui_component::{
     ActiveTheme, Root,
     input::{Input, InputState},
@@ -24,6 +27,7 @@ use gpui_component::{
 };
 use gpui_plot::{Plot, PlotStyle, Series, data_range};
 use gpui_schema::{NodeFilter, SchemaForm, SchemaFormEvent};
+use libm::atan2;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -50,26 +54,61 @@ enum ConfigSource {
 // Config types
 // ============================================================================
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+struct Vec2 {
+    x: f64, 
+    y: f64, 
+}
+
+impl Default for Vec2 {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0 }
+    }
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+enum CentralObject {
+    Single{ mass: f64 },
+    Binary{ mass: f64, q: f64, a: f64, e: Vec2 },
+}
+
+
+impl Default for CentralObject {
+    fn default() -> Self {
+        Self::Binary {
+            mass: 1.0, 
+            q: 0.1, 
+            a: 0.5, 
+            e: Vec2::default(), 
+        }
+    }
+}
+
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 struct DustPhysics {
+    /// Initial simulation time
+    tstart: f64, 
     /// Final simulation time
     tfinal: f64,
     /// Time step
     dt: f64,
     /// Gravitational softening length
     softening: f64,
-    /// Mass of the central object
-    central_mass: f64,
+    /// Type of central object
+    central_object: CentralObject, 
 }
 
 impl Default for DustPhysics {
     fn default() -> Self {
         Self {
+            tstart: 0.0, 
             tfinal: 10.0,
             dt: 0.001,
             softening: 0.01,
-            central_mass: 1.0,
+            central_object: CentralObject::default(), 
         }
     }
 }
@@ -81,6 +120,8 @@ impl Validate for DustPhysics {}
 struct DustInitial {
     /// Number of particles
     num_particles: usize,
+    /// Position of center of disk
+    disk_center: DiskCenter, 
     /// Initial condition setup
     setup: DustSetup,
 }
@@ -89,6 +130,7 @@ impl Default for DustInitial {
     fn default() -> Self {
         Self {
             num_particles: 1000,
+            disk_center: DiskCenter::Arbitrary { x: 0.0, y: 0.0 }, 
             setup: DustSetup::Ring,
         }
     }
@@ -102,6 +144,13 @@ enum DustSetup {
     Ring,
     /// Particles in a randomized disk
     RandomDisk,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+enum DiskCenter {
+    Primary, 
+    Secondary, 
+    Arbitrary{ x: f64, y: f64 }, 
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -172,19 +221,144 @@ impl NodeFilter for DustFilter {
 // Solver
 // ============================================================================
 
+fn magnitude(v: [f64; 2]) -> f64 {
+    (v[0] * v[0] + v[1] * v[1]).sqrt()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+struct AnomalyParams {
+    mass: f64, 
+    q: f64, 
+    a: f64, 
+    e: Vec2, 
+    mean_anom: f64, 
+}
+
+impl Default for AnomalyParams {
+    fn default() -> Self {
+        Self {
+            mass: 1.0, 
+            q: 0.1, 
+            a: 1.0, 
+            e: Vec2{ x: 0.0, y: 0.0 }, 
+            mean_anom: 0.0, 
+        }
+    }
+}
+
+impl AnomalyParams {
+    /// Magnitude of eccentricity vector
+    fn e_mag(&self) -> f64 {
+        self.e.x * self.e.x + self.e.y * self.e.y
+    }
+    /// Mean angular motion of object (angular frequency)
+    fn mean_angular_motion(&self) -> f64 {
+        (self.mass / self.a / self.a / self.a).sqrt()
+    }
+    /// Period of object motion
+    fn period(&self) -> f64 {
+        2. * PI / self.mean_angular_motion()
+    }
+    /// Kepler's equation
+    fn f(&self, ecc_anom: f64) -> f64 {
+        ecc_anom - self.e_mag() * ecc_anom.sin() - self.mean_anom
+    }
+    /// Derivative of Kepler's equation (wrt E)
+    fn fprime(&self, ecc_anom: f64) -> f64 {
+        1. - self.e_mag() * ecc_anom.cos()
+    }
+    /// Calculate eccentric anomaly E for object orbit
+    fn eccentric_anomaly(&mut self, time_since_periapse: f64) -> f64 {
+        let w = self.mean_angular_motion();
+        let p = self.period();
+        let t = time_since_periapse - p * (time_since_periapse / p).floor();
+        self.mean_anom = w * t;
+        let ecc_anom = newton_raphson(|ecc_anom| self.f(ecc_anom), |ecc_anom| self.fprime(ecc_anom), self.mean_anom);
+        
+        ecc_anom
+    }
+}
+
+fn newton_raphson<F, G>(f: F, fprime: G, mut x: f64) -> f64 
+where 
+    F: Fn(f64) -> f64, 
+    G: Fn(f64) -> f64, 
+{
+    let mut n = 0;
+    while f(x).abs() > 1e-15 {
+        x -= f(x) / fprime(x);
+        n += 1;
+        if n > 10 {
+            panic!("newton_raphson: no solution!");
+        }
+    }
+    x
+}
+
+/// Position of primary and secondary objects in binary configuration; origin at CM
+fn orbital_state(mut p: AnomalyParams, time_since_periapse: f64) -> ([f64; 2], [f64; 2]) {
+    let e_mag = p.e_mag();
+    let ecc_anom = p.eccentric_anomaly(time_since_periapse);
+    let x = p.a * (ecc_anom.cos() - e_mag);
+    let y = p.a * (1. - e_mag * e_mag).sqrt() * ecc_anom.sin();
+    // Rotate orbit based on eccentricity vector with argument of periapsis ω
+    let arg_of_peri = libm::atan2(p.e.y, p.e.x);
+    let x_rot = x * arg_of_peri.cos() - y * arg_of_peri.sin();
+    let y_rot = x * arg_of_peri.sin() + y * arg_of_peri.cos();
+    // Secondary position
+    let x2 = - x_rot / (1. + p.q);
+    let y2 = - y_rot / (1. + p.q);
+    // Primary position
+    let x1 = - x2 * p.q;
+    let y1 = - y2 * p.q;
+
+    ([x1, y1], [x2, y2])
+}
+
+
 struct Dust {
     physics: DustPhysics,
     initial: DustInitial,
 }
 
 impl Dust {
-    /// Compute gravitational acceleration from central mass at origin.
-    fn acceleration(&self, x: f64, y: f64) -> (f64, f64) {
-        let eps = self.physics.softening;
-        let r2 = x * x + y * y + eps * eps;
-        let r = r2.sqrt();
-        let a = -self.physics.central_mass / (r * r2);
-        (a * x, a * y)
+    /// Compute gravitational acceleration. 
+    fn acceleration(&self, x: f64, y: f64, state: &State) -> (f64, f64) {
+        match self.physics.central_object {
+            CentralObject::Single { mass } => {
+                let eps = self.physics.softening;
+                let r2 = x * x + y * y + eps * eps;
+                let r = r2.sqrt();
+                let acc = -mass / (r * r2);
+                (acc * x, acc * y) 
+            }
+            CentralObject::Binary { mass, q, a, e } => {
+                let p = AnomalyParams{ 
+                    mass: mass, 
+                    q: q, 
+                    a: a, 
+                    e: e, 
+                    mean_anom: 0.0, 
+                };
+                let eps = self.physics.softening;
+                let m1 = mass / (1. + p.q);
+                let m2 = p.q * m1;
+                let time_since_periapse = state.time;
+                let (r1, r2) = orbital_state(p, time_since_periapse);
+                let r1_mag = magnitude([x - r1[0], y - r1[1]]);
+                let r2_mag = magnitude([x - r2[0], y - r2[1]]);
+                let r1_sq = r1_mag * r1_mag + eps * eps;
+                let r2_sq = r2_mag * r2_mag + eps * eps;
+
+                let acc1 = - m1 / r1_sq / r1_sq.sqrt();
+                let acc2 = - m2 / r2_sq / r2_sq.sqrt();
+                let a1 = (acc1 * (x - r1[0]), acc1 * (y - r1[1]));
+                let a2 = (acc2 * (x - r2[0]), acc2 * (y - r2[1]));
+
+                (a1.0 + a2.0, a1.1 + a2.1)
+            }
+        }
     }
 }
 
@@ -207,20 +381,59 @@ impl Solver for Dust {
         let mut y = Vec::with_capacity(n);
         let mut vx = Vec::with_capacity(n);
         let mut vy = Vec::with_capacity(n);
-
+        
+        let r1: [f64; 2];
+        let r2: [f64; 2];
+        let rshift: [f64; 2];
+        let vshift: [f64; 2];
+        let mshift: f64;
+        match self.physics.central_object {
+            CentralObject::Binary { mass, q, a, e } => {
+                let p = AnomalyParams { mass: mass, q: q, a: a, e: e, mean_anom: 0.0 };
+                (r1, r2) = orbital_state(p, self.physics.tstart);
+                let r12 = [r1[0] + r2[0], r1[1] + r2[1]];
+                let theta1 = atan2(r1[1], r1[0]);
+                let theta2 = atan2(r2[1], r2[0]);
+                match self.initial.disk_center {
+                    DiskCenter::Primary => {
+                        mshift = mass / (1. + q);
+                        let v1 = (mshift * q / magnitude(r12)).sqrt();
+                        rshift = r1;
+                        vshift = [- v1 * theta1.sin(), v1 * theta1.cos()];
+                    }
+                    DiskCenter::Secondary => {
+                        mshift = mass * q / (1. + q);
+                        let v2 = (mshift / q / magnitude(r12)).sqrt();
+                        rshift = r2;
+                        vshift = [- v2 * theta2.sin(), v2 * theta2.cos()];
+                    }
+                    DiskCenter::Arbitrary { x, y } => {
+                        rshift = [x, y];
+                        vshift = [0.0, 0.0];
+                        mshift = mass;
+                    }
+                }
+                    }
+                    CentralObject::Single { mass } => {
+                        rshift = [0.0, 0.0];
+                        vshift = [0.0, 0.0];
+                        mshift = mass;
+                    }
+                }
+        
         match self.initial.setup {
             DustSetup::Ring => {
                 for i in 0..n {
                     let theta = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
-                    let r = 1.0;
-                    let px = r * theta.cos();
-                    let py = r * theta.sin();
+                    let r = 0.1;
+                    let px = r * theta.cos() + rshift[0];
+                    let py = r * theta.sin() + rshift[1];
                     // Circular orbital velocity: v = sqrt(GM/r)
-                    let v = (self.physics.central_mass / r).sqrt();
+                    let v = (mshift / r).sqrt();
                     x.push(px);
                     y.push(py);
-                    vx.push(-v * theta.sin());
-                    vy.push(v * theta.cos());
+                    vx.push(-v * theta.sin() + vshift[0]);
+                    vy.push(v * theta.cos() + vshift[1]);
                 }
             }
             DustSetup::RandomDisk => {
@@ -229,19 +442,19 @@ impl Solver for Dust {
                 for i in 0..n {
                     let r = 0.3 + 0.7 * (i as f64 / n as f64).sqrt();
                     let theta = 2.0 * std::f64::consts::PI * (i as f64 * phi);
-                    let px = r * theta.cos();
-                    let py = r * theta.sin();
-                    let v = (self.physics.central_mass / r).sqrt();
+                    let px = r * theta.cos() + rshift[0];
+                    let py = r * theta.sin() + rshift[1];
+                    let v = (mshift / r).sqrt();
                     x.push(px);
                     y.push(py);
-                    vx.push(-v * theta.sin());
-                    vy.push(v * theta.cos());
+                    vx.push(-v * theta.sin() + vshift[0]);
+                    vy.push(v * theta.cos() + vshift[1]);
                 }
             }
         }
 
         State {
-            time: 0.0,
+            time: self.physics.tstart,
             x,
             y,
             vx,
@@ -266,7 +479,7 @@ impl Solver for Dust {
 
         // Leapfrog (kick-drift-kick)
         for i in 0..n {
-            let (ax, ay) = self.acceleration(state.x[i], state.y[i]);
+            let (ax, ay) = self.acceleration(state.x[i], state.y[i], &state);
             state.vx[i] += 0.5 * dt * ax;
             state.vy[i] += 0.5 * dt * ay;
         }
@@ -275,7 +488,7 @@ impl Solver for Dust {
             state.y[i] += dt * state.vy[i];
         }
         for i in 0..n {
-            let (ax, ay) = self.acceleration(state.x[i], state.y[i]);
+            let (ax, ay) = self.acceleration(state.x[i], state.y[i], &state);
             state.vx[i] += 0.5 * dt * ax;
             state.vy[i] += 0.5 * dt * ay;
         }
@@ -310,6 +523,9 @@ impl Solver for Dust {
 // GPUI Application
 // ============================================================================
 
+fn rgb_tuple(r: u8, g: u8, b: u8) -> gpui::Rgba {
+    gpui::rgb((r as u32) << 16 | (g as u32) << 8 | (b as u32))
+}
 struct DustApp {
     handle: DriverHandle,
     form: Entity<SchemaForm>,
@@ -322,6 +538,7 @@ struct DustApp {
     show_log: Rc<Cell<bool>>,
     left_tab: LeftTab,
     config_source: ConfigSource,
+    binary_params: Option<AnomalyParams>, 
 }
 
 impl Focusable for DustApp {
@@ -363,13 +580,34 @@ impl DustApp {
         // App-specific: update plot data (preserves pan/zoom view state)
         if diff.iteration_advanced || diff.state_changed {
             let snap = self.snapshot_reader.snapshot();
+            let time = snap.time;
             let style = PlotStyle::from_theme(cx.theme());
+            let mut star_series = Vec::new();
+            if let Some(params) = self.binary_params.clone() {
+                let (r1, r2) = orbital_state(params, time);
+                star_series.push(
+                    Series::scatter(vec![r1[0]], vec![r1[1]])
+                        .label("primary")
+                        .marker_radius(6.0)
+                        .color(rgb_tuple(255, 220, 120))
+                );
+                star_series.push(
+                    Series::scatter(vec![r2[0]], vec![r2[1]])
+                        .label("secondary")
+                        .marker_radius(5.0)
+                        .color(rgb_tuple(255, 149, 120))
+                );
+            }
             let first_data = diff.state_changed && snap.has_state;
             if let (Some(x), Some(y)) = (snap.linear.get("x"), snap.linear.get("y")) {
                 self.plot.update(cx, |plot, cx| {
-                    plot.set_series(vec![
-                        Series::scatter(x.clone(), y.clone()).label("particles"),
-                    ]);
+                    let mut series = vec![
+                        Series::scatter(x.clone(), y.clone())
+                            .label("particles")
+                            .marker_radius(1.5),
+                    ];
+                    series.extend(star_series);
+                    plot.set_series(series);
                     plot.set_style(style);
                     if first_data {
                         let (xmin, xmax) = data_range(x);
@@ -447,6 +685,19 @@ impl DustApp {
             }
             // Full config JSON — update the form unless it was the source
             DriverEvent::Config(value) => {
+                if let Ok(config) = serde_json::from_value::<SimulationConfig<Dust>>(value.clone()) {
+                    if let CentralObject::Binary { mass, q, a, e } = config.physics.central_object {
+                        self.binary_params = Some(AnomalyParams {
+                            mass,
+                            q,
+                            a,
+                            e,
+                            mean_anom: 0.0,
+                        });
+                    } else {
+                        self.binary_params = None;
+                    }
+                }
                 if self.config_source != ConfigSource::Form {
                     let form = cx.new(|cx| {
                         let mut form = SchemaForm::new(&self.schema, &value, window, cx);
@@ -779,6 +1030,7 @@ fn main() {
                         show_log: Rc::new(Cell::new(false)),
                         left_tab: LeftTab::Config,
                         config_source: ConfigSource::Driver,
+                        binary_params: None, 
                     };
                     app.subscribe_form(window, cx);
                     app
