@@ -1565,23 +1565,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
-name = "driver"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "gpui",
- "gpui-component",
- "ratatui",
- "rmp-serde",
- "ron",
- "rustyline",
- "schema-tui",
- "schemars",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "dtor"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1607,12 +1590,12 @@ name = "dust"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "driver",
  "gpui",
  "gpui-component",
  "gpui-plot",
  "gpui-schema",
  "libm",
+ "march",
  "rand 0.8.5",
  "ron",
  "schemars",
@@ -2578,7 +2561,6 @@ dependencies = [
 [[package]]
 name = "gpui-plot"
 version = "0.1.0"
-source = "git+https://github.com/harc-lang/gpui-plot.git#8597c654df270a3141233d2b5d4535ad5b777e50"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2588,7 +2570,6 @@ dependencies = [
 [[package]]
 name = "gpui-schema"
 version = "0.1.0"
-source = "git+https://github.com/harc-lang/gpui-schema.git#bc67e843ef86eca9acf005157ff6ca8371dcafcd"
 dependencies = [
  "anyhow",
  "gpui",
@@ -3686,6 +3667,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "march"
+version = "0.1.0"
+source = "git+https://github.com/harc-lang/march.git#a008e1a03ac8fd6476aa713242b968695530e201"
+dependencies = [
+ "crossterm",
+ "gpui",
+ "gpui-component",
+ "ratatui",
+ "rmp-serde",
+ "ron",
+ "rustyline",
+ "schema-tui",
+ "schemars",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5580,7 +5579,6 @@ dependencies = [
 [[package]]
 name = "schema-tui"
 version = "0.1.0"
-source = "git+https://github.com/harc-lang/schema-tui.git#5a8be0330d32d96ebb99227e18e40e9c86de0fd8"
 dependencies = [
  "crossterm",
  "ratatui",

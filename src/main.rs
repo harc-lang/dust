@@ -3,7 +3,6 @@
 use core::str;
 use std::f64::consts::PI;
 use std::ops::{Add, Sub, Mul, Div, AddAssign};
-use std::os::macos::raw::stat;
 // use gpui_component::label;
 use rand::Rng;
 
@@ -11,11 +10,11 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use driver::command::{Command, Event as DriverEvent};
-use driver::config::SimulationConfig;
-use driver::gpui_frontend::{DriverFooter, DriverLog, Quit, SnapshotReader};
-use driver::worker::DriverHandle;
-use driver::{Action, CliArgs, Driver, DriverState, Mode, PlotData, Solver, StepInfo, Validate};
+use march::command::{Command, Event as DriverEvent};
+use march::config::SimulationConfig;
+use march::gpui_frontend::{DriverFooter, DriverLog, Quit, SnapshotReader};
+use march::worker::DriverHandle;
+use march::{Action, CliArgs, Driver, DriverState, Mode, PlotData, Solver, StepInfo, Validate};
 use gpui::{
     App, AppContext as _, Application, Context, Entity, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyDownEvent, Menu, MenuItem, ParentElement, Render,
@@ -166,6 +165,7 @@ impl Vec3 {
     fn mag(&self) -> f64 {
         (self.dot(*self)).sqrt()
     }
+    #[allow(dead_code)]
     fn normalize(&self) -> Self {
         *self * (1. /  self.mag())
     }
@@ -1256,7 +1256,7 @@ fn main() {
     };
 
     if cli.mode != Mode::Gui || cli.action != Action::Run {
-        driver::app::run::<Dust>(cli);
+        march::app::run::<Dust>(cli);
         return;
     }
 
@@ -1302,7 +1302,7 @@ fn main() {
                 ));
                 let (driver, init_msgs) =
                     Driver::new(config.clone(), solver, None, DriverState::new());
-                let handle = driver::worker::spawn(driver, init_msgs);
+                let handle = march::worker::spawn(driver, init_msgs);
 
                 let schema = schemars::schema_for!(SimulationConfig<Dust>);
                 let value = serde_json::to_value(&config).unwrap();
